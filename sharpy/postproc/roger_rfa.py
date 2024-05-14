@@ -8,6 +8,7 @@ import scipy
 import itertools
 import matplotlib.pyplot as plt
 import sharpy.utils.cout_utils as cout
+import warnings
 
 @solver
 class Roger_RFA(BaseSolver):
@@ -28,12 +29,12 @@ class Roger_RFA(BaseSolver):
     settings_options['rfa_type'] = ['roger', 'eversman']
 
     settings_types['num_poles'] = 'int'
-    settings_default['num_poles'] = 3
+    settings_default['num_poles'] = 4
     settings_description ['num_poles'] = 'Number of poles to fit for approximation.'
 
     settings_types['imag_weight'] = 'float'
     settings_default['imag_weight'] = 1.0
-    settings_description ['imag_weight'] = 'Add or reduce effect of imaginary component relative to real component in fit.'
+    settings_description ['imag_weight'] = 'Weighting of imaginary component relative to real component for matrix fit.'
 
     settings_types['k_min'] = 'float'
     settings_default['k_min'] = 1e-4
@@ -214,23 +215,26 @@ class Roger_RFA(BaseSolver):
                     else:
                         raise NotImplementedError
                     
+            try:
+                xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
+                for i_p in range(n_p):
+                    Aq_roger.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
 
-            xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
-            for i_p in range(n_p):
-                Aq_roger.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
-
-            for i_k, k in enumerate(k_vals):
-                Qq_roger[:, :, i_k] = Aq_roger[0] + 1j*k*Aq_roger[1]
-                for i_p, pole in enumerate(poles):
-                    if self.settings['rfa_type'] == 'roger':
-                        Qq_roger[:, :, i_k] += Aq_roger[i_p+2]*1j*k/(1j*k+pole)
-                    elif self.settings['rfa_type'] == 'eversman':
-                        Qq_roger[:, :, i_k] += Aq_roger[i_p+2]/(1j*k+pole)
+                for i_k, k in enumerate(k_vals):
+                    Qq_roger[:, :, i_k] = Aq_roger[0] + 1j*k*Aq_roger[1]
+                    for i_p, pole in enumerate(poles):
+                        if self.settings['rfa_type'] == 'roger':
+                            Qq_roger[:, :, i_k] += Aq_roger[i_p+2]*1j*k/(1j*k+pole)
+                        elif self.settings['rfa_type'] == 'eversman':
+                            Qq_roger[:, :, i_k] += Aq_roger[i_p+2]/(1j*k+pole)
+                test = np.linalg.norm(np.abs((Qq_roger - Qq_sample)/Qq_sample), 'fro', (0, 1))
+                # errq = np.sum(np.linalg.norm(np.abs((Qq_roger - Qq_sample)/Qq_sample), 'fro', (0, 1)))/n_k
+                # errq = np.sum(np.abs((Qq_roger - Qq_sample)/Qq_sample))/Qq_sample.size
+                errq = np.linalg.norm(np.linalg.norm(np.nan_to_num(np.abs((Qq_roger - Qq_sample)/Qq_sample)), 'fro', (0, 1)))
             
-            # errq = np.sum(np.linalg.norm(np.abs((Qq_roger - Qq_sample)/Qq_sample), 'fro', (0, 1)))/n_k
-            # errq = np.sum(np.abs((Qq_roger - Qq_sample)/Qq_sample))/Qq_sample.size
-            errq = np.linalg.norm(np.linalg.norm(np.nan_to_num(np.abs((Qq_roger - Qq_sample)/Qq_sample)), 'fro', (0, 1)))
-            
+            except:
+                errq = 1e32
+                cout.cout_wrap('Combination did not converge', 2)
             return Qq_roger, Aq_roger, errq, R_ls
 
         def least_squares_q_err(poles):
@@ -238,9 +242,10 @@ class Roger_RFA(BaseSolver):
 
         # Manual pole input
         if len(self.settings['p_input']) != 0:
+            poles = self.settings['p_input']
             cout.cout_wrap('Fitting RFA using input poles', 0)
             [Qq_roger, Aq_roger, errq, R_ls] = least_squares_q(self.settings['p_input'])
-            cout.cout_wrap(f"\tAveraged relative error: {errq}", 1)
+            cout.cout_wrap(f"    Averaged relative error: {errq}", 1)
 
         # Pole optimisation
         else:                                               
@@ -249,8 +254,8 @@ class Roger_RFA(BaseSolver):
             cout.cout_wrap('Discrete optimisation to fit RFA', 0)
             cout.cout_wrap(f"    Combinations: {len(poles_all_comb)}", 1)
 
-            errq_min = 1e9
-            poles_disc_min = 1e9*np.ones(n_p)
+            errq_min = 1e32
+            poles_disc_min = np.zeros(n_p)
 
             for poles_comb in poles_all_comb:
                 errq = least_squares_q_err(poles_comb)
@@ -258,21 +263,22 @@ class Roger_RFA(BaseSolver):
                     errq_min = errq
                     poles_disc_min = poles_comb
 
-            cout.cout_wrap('Discrete optimisation complete', 0)
-            cout.cout_wrap('Poles:', 1)
+            cout.cout_wrap('    Discrete optimisation complete', 1)
+            cout.cout_wrap('    Poles:', 1)
             for pole in poles_disc_min:
-                cout.cout_wrap(f"    {pole:.4f}", 2)
-            cout.cout_wrap(f"Averaged relative error: {errq_min:4f}", 1)
+                cout.cout_wrap(f"        {pole:.4f}", 2)
+            cout.cout_wrap(f"    Averaged relative error: {errq_min:4f}", 1)
 
             # Gradient optimisation
+            cout.cout_wrap('Gradient optimisation to fit RFA', 0)
             poles = list(scipy.optimize.fmin(least_squares_q_err, poles_disc_min))
             [Qq_roger, Aq_roger, errq, R_ls] = least_squares_q(poles)
 
-            cout.cout_wrap('Gradient optimisation complete', 0)
+            cout.cout_wrap('    Gradient optimisation complete', 1)
             cout.cout_wrap('    Poles:', 1)
             for pole in poles:
-                cout.cout_wrap(f"    {pole:.4f}", 2)
-            cout.cout_wrap(f"Averaged relative error: {errq:4f}", 1)
+                cout.cout_wrap(f"        {pole:.4f}", 2)
+            cout.cout_wrap(f"    Averaged relative error: {errq:4f}", 1)
 
         out_dict = {'poles': poles, 'matrices_q': Aq_roger, 'sampled_ss_q_tf': Qq_sample, 'sampled_rfa_q_tf': Qq_roger, 'k': k_vals, \
                      'err_q': errq, 'matrices_w': None, 'sampled_ss_w_tf': None, 'sampled_rfa_w_tf': None, 'err_w': None}
@@ -321,38 +327,37 @@ class Roger_RFA(BaseSolver):
 
         # Plotting
         if self.settings['plot_rfa']:
-            if self.settings['plot_type'] == 'bode':
-                _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
-                for i_q_out in range(self.settings['num_q_plot']):
-                    for i_q_in in range(self.settings['num_q_plot']):
-                        ax[2*i_q_out, i_q_in].plot(k_vals, np.abs(Qq_sample[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out, i_q_in].plot(k_vals, np.abs(Qq_roger[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out, i_q_in].set_xscale('log')
-                        ax[2*i_q_out+1, i_q_in].plot(k_vals, np.angle(Qq_sample[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out+1, i_q_in].plot(k_vals, np.angle(Qq_roger[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out+1, i_q_in].set_xscale('log')
-
-            if self.settings['plot_type'] == 'real_imag':
-                _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
-                for i_q_out in range(self.settings['num_q_plot']):
-                    for i_q_in in range(self.settings['num_q_plot']):
-                        ax[2*i_q_out, i_q_in].plot(k_vals, np.real(Qq_sample[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out, i_q_in].plot(k_vals, np.real(Qq_roger[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out, i_q_in].set_xscale('log')
-                        ax[2*i_q_out+1, i_q_in].plot(k_vals, np.imag(Qq_sample[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out+1, i_q_in].plot(k_vals, np.imag(Qq_roger[i_q_out, i_q_in, :]))
-                        ax[2*i_q_out+1, i_q_in].set_xscale('log')
-
-            elif self.settings['plot_type'] == 'polar':
-                _, ax = plt.subplots(self.settings['num_q_plot'], self.settings['num_q_plot'])
-                for i_q_out in range(self.settings['num_q_plot']):
-                    for i_q_in in range(self.settings['num_q_plot']):
-                        ax[i_q_out, i_q_in].plot(np.real(Qq_sample[i_q_out, i_q_in, :]), np.imag(Qq_sample[i_q_out, i_q_in, :]))
-                        ax[i_q_out, i_q_in].plot(np.real(Qq_roger[i_q_out, i_q_in, :]), np.imag(Qq_roger[i_q_out, i_q_in, :]))
-                    
+            match self.settings['plot_type']:
+                case 'bode':
+                    _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
+                    for i_q_out in range(self.settings['num_q_plot']):
+                        for i_q_in in range(self.settings['num_q_plot']):
+                            ax[2*i_q_out, i_q_in].plot(k_vals, np.abs(Qq_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out, i_q_in].plot(k_vals, np.abs(Qq_roger[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out, i_q_in].set_xscale('log')
+                            ax[2*i_q_out+1, i_q_in].plot(k_vals, np.angle(Qq_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].plot(k_vals, np.angle(Qq_roger[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].set_xscale('log')
+                case 'real_imag':
+                    _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
+                    for i_q_out in range(self.settings['num_q_plot']):
+                        for i_q_in in range(self.settings['num_q_plot']):
+                            ax[2*i_q_out, i_q_in].plot(k_vals, np.real(Qq_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out, i_q_in].plot(k_vals, np.real(Qq_roger[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out, i_q_in].set_xscale('log')
+                            ax[2*i_q_out+1, i_q_in].plot(k_vals, np.imag(Qq_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].plot(k_vals, np.imag(Qq_roger[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].set_xscale('log')
+                case 'polar':
+                    _, ax = plt.subplots(self.settings['num_q_plot'], self.settings['num_q_plot'])
+                    for i_q_out in range(self.settings['num_q_plot']):
+                        for i_q_in in range(self.settings['num_q_plot']):
+                            ax[i_q_out, i_q_in].plot(np.real(Qq_sample[i_q_out, i_q_in, :]), np.imag(Qq_sample[i_q_out, i_q_in, :]))
+                            ax[i_q_out, i_q_in].plot(np.real(Qq_roger[i_q_out, i_q_in, :]), np.imag(Qq_roger[i_q_out, i_q_in, :]))     
             ax[0, 0].legend(["Sampled", "RFA"])
             plt.show()      
 
         # Save to case data
-        self.data.rfa = out_dict
+        self.data.linear.rfa = out_dict
+
         return self.data

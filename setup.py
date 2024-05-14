@@ -128,7 +128,7 @@ setup(
     #     ("./lib/UVLM/lib", ["libuvlm.so"]),
     #     ("./lib/xbeam/lib", ["libxbeam.so"])
     #     ],
-    python_requires=">=3.8",
+    python_requires=">=3.11",
     install_requires=[
         "numpy",
         "configobj",
@@ -145,7 +145,8 @@ setup(
         "openpyxl>=3.0.10",
         "lxml>=4.4.1",
         "PySocks",
-        "PyYAML"
+        "PyYAML",
+        "pyyeti"
     ],
     extras_require={
         "docs": [

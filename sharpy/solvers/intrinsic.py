@@ -36,7 +36,7 @@ class IntrinsicSolver(BaseSolver):
     settings_description['print_info'] = 'Write status to screen'
 
     settings_types['num_modes'] = 'int'
-    settings_default['num_modes'] = 20
+    settings_default['num_modes'] = 0
     settings_description['num_modes'] = 'Number of modes to retain'
 
     settings_types['delta_curved'] = 'float'
@@ -48,12 +48,16 @@ class IntrinsicSolver(BaseSolver):
     settings_description['plot_eigenvalues'] = 'Plot to screen root locus diagram'
 
     settings_types['use_custom_timestep'] = 'int'
-    settings_default['use_custom_timestep'] = -1
-    settings_description['use_custom_timestep'] = 'If > -1, it will use that time step geometry for calculating the modes'
+    settings_default['use_custom_timestep'] = 0
+    settings_description['use_custom_timestep'] = 'Time step of structure for calculating modes'
 
     settings_types['component_names'] = 'list(str)'
     settings_default['component_names'] = []
     settings_description['component_names'] = 'Name components of the structure. Will use lettering [A, B, ...] by default'
+
+    settings_types['dynamic_tstep_init'] = 'int'
+    settings_default['dynamic_tstep_init'] = -1
+    settings_description['dynamic_tstep_init'] = 'Time step of structure for calculating q0'
 
     # Settings to be passed to FEM4INAS
     settings_types['engine'] = 'str'
@@ -69,7 +73,7 @@ class IntrinsicSolver(BaseSolver):
     settings_description['sim_type'] = 'Simulation type to be used in FEM4INAS'
 
     settings_types['solution'] = 'str'
-    settings_default['solution'] = 'static'
+    settings_default['solution'] = 'dynamic'
     settings_description['solution'] = 'Solution type to be used in FEM4INAS'
 
     settings_types['solver_library'] = 'str'
@@ -77,8 +81,12 @@ class IntrinsicSolver(BaseSolver):
     settings_description['solver_library'] = 'Solver library to be used in FEM4INAS'
 
     settings_types['solver_function'] = 'str'
-    settings_default['solver_function'] = 'newton_raphson'
+    settings_default['solver_function'] = 'ode'
     settings_description['solver_function'] = 'Solver function to be used in FEM4INAS'
+
+    settings_types['solver_name'] = 'str'
+    settings_default['solver_name'] = 'Dopri5'
+    settings_description['solver_name'] = 'Solver name to be used in FEM4INAS'
 
     settings_types['rtol'] = 'float'
     settings_default['rtol'] = 1e-6
@@ -100,6 +108,34 @@ class IntrinsicSolver(BaseSolver):
     settings_default['kappa'] = 1e-2
     settings_description['kappa'] = 'Kappa value to be used in FEM4INAS'
 
+    settings_types['t1'] = 'float'
+    settings_default['t1'] = 10.0
+    settings_description['t1'] = 'Simulation time (s)'
+
+    settings_types['tn'] = 'int'
+    settings_default['tn'] = 5000
+    settings_description['tn'] = 'Number of simulation steps'
+
+    settings_types['rho'] = 'float'
+    settings_default['rho'] = 1.225
+    settings_description['rho'] = 'Freestream density (kg/m^3)'
+
+    settings_types['u_inf'] = 'float'
+    settings_default['u_inf'] = 50.0
+    settings_description['u_inf'] = 'Freestream velocity (m/s)'
+
+    settings_types['c_ref'] = 'float'
+    settings_default['c_ref'] = 1.8288
+    settings_description['c_ref'] = 'Reference chord (m)'
+
+    settings_types['gravity_on'] = 'bool'
+    settings_default['gravity_on'] = True
+    settings_description['gravity_on'] = 'Enable gravity'
+
+    settings_types['aero_on'] = 'bool'
+    settings_default['aero_on'] = False
+    settings_description['aero_on'] = 'Enable aerodynamics'
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
 
@@ -116,21 +152,20 @@ class IntrinsicSolver(BaseSolver):
             self.settings = custom_settings
         settings_utils.to_custom_types(self.settings, self.settings_types, self.settings_default)	
 
-        # Select timestep for initialisation
-        self.data.ts = -1
-        if int(self.settings['use_custom_timestep']) > -1:
-            self.data.ts = self.settings['use_custom_timestep']
-
     def run(self, **kwargs):
-        FEM_route = self.generate_FEM_files()
-        input = self.generate_settings_file(FEM_route)
+        FEM_route, evects = self.generate_FEM_files()
+        q0_init = self.q0_init(evects)
+        input = self.generate_settings_file(FEM_route, q0_init)
         config = Config(input)
         cout_wrap("Running FEM4INAS\n")
         sol = fem4inas_main.main(input_obj=config)
+        q_out = np.array(sol.dynamicsystem_s1.q)
+        ra = np.array(sol.dynamicsystem_s1.ra)
+
         self.intrinsic_output_convert(sol)
 
     # Returns the global mass and stiffness matrices
-    def get_M_C_K(self, n_dof: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_M_C_K(self, n_dof: int, tstep: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         M_full = np.zeros([n_dof, n_dof],
                             dtype=ct.c_double, order='F')
         C_full = np.zeros([n_dof, n_dof],
@@ -138,10 +173,10 @@ class IntrinsicSolver(BaseSolver):
         K_full = np.zeros([n_dof, n_dof],
                             dtype=ct.c_double, order='F')
 
-        xbeamlib.cbeam3_solv_modal(self.data.structure, self.settings, self.data.ts,
-                                        M_full, K_full, C_full)
+        xbeamlib.cbeam3_solv_modal(self.data.structure, self.settings, tstep,
+                                        M_full, C_full, K_full)
 
-        return np.array(M_full), np.array(K_full), np.array(C_full)
+        return np.array(M_full), np.array(C_full), np.array(K_full)
 
     # Returns the eigenvalues and eigenvectors of the system
     def get_eigs0(self, n_dof, M_full, C_full, K_full) -> tuple[np.ndarray, np.ndarray]:
@@ -168,7 +203,7 @@ class IntrinsicSolver(BaseSolver):
 
     # Returns the grid nodes of the system
     def get_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        pos = self.data.structure.timestep_info[self.data.ts].pos
+        pos = self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos
         connectivity = self.data.structure.connectivities
         beam_number = self.data.structure.beam_number
         return pos, connectivity, beam_number 
@@ -177,8 +212,9 @@ class IntrinsicSolver(BaseSolver):
         cout_wrap("Generating input FEM data")
         # Save structure matrices
         n_dof = self.data.structure.num_dof.value
-        M_full, C_full, K_full = self.get_M_C_K(n_dof)
+        M_full, C_full, K_full = self.get_M_C_K(n_dof, self.settings['use_custom_timestep'])
         evals, evects = self.get_eigs0(n_dof, M_full, C_full, K_full)
+
         FEM_route = self.data.case_route + 'intrinsic_FEM/'
         os.mkdir(FEM_route)
         np.save(FEM_route + 'Ma', M_full)
@@ -207,15 +243,24 @@ class IntrinsicSolver(BaseSolver):
         f.close()
         
         cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
-        return FEM_route
+        return FEM_route, evects
+    
+    def q0_init(self, evects) -> list:
+        tstep_q0 = self.settings['dynamic_tstep_init']
+        n_node = self.data.structure.num_node
+        x0 = self.data.structure.timestep_info[tstep_q0].q[:(n_node-1)*6]
+        q0 = np.linalg.lstsq(evects, x0)[0]
+        return list(q0)
+        
 
-    def generate_settings_file(self, FEM_route) -> Inputs:
+
+    def generate_settings_file(self, FEM_route, q0_init) -> Inputs:
         ints_output_folder = self.data.output_folder + 'intrinsic/'
         os.mkdir(ints_output_folder)
 
         inp = Inputs()
         inp.engine = self.settings['engine']
-        inp.fem.connectivity = dict(A=None)             #TODO: replace with connectivity
+        inp.fem.connectivity = dict(A=['B'], B = None)             #TODO: replace with connectivity
         inp.fem.folder = FEM_route
         inp.fem.num_modes = self.settings['num_modes']
         inp.driver.typeof = self.settings['driver']
@@ -224,27 +269,76 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.solution = self.settings['solution']
         inp.systems.sett.s1.solver_library = self.settings['solver_library']
         inp.systems.sett.s1.solver_function = self.settings['solver_function']
-        inp.systems.sett.s1.solver_settings = dict(rtol=self.settings['rtol'],
-                                                atol=self.settings['atol'],
-                                                max_steps=self.settings['max_steps'],
-                                                norm=self.settings['norm'],
-                                                kappa=self.settings['kappa'])
+        # inp.systems.sett.s1.solver_settings = dict(rtol=self.settings['rtol'],
+        #                                         atol=self.settings['atol'],
+        #                                         max_steps=self.settings['max_steps'],
+        #                                         norm=self.settings['norm'],
+        #                                         kappa=self.settings['kappa'])
+        inp.systems.sett.s1.solver_settings = dict(solver_name=self.settings['solver_name'])
         
-        inp.systems.sett.s1.xloads.follower_forces = True
-        inp.systems.sett.s1.xloads.follower_points = [[25, 1]]
-        inp.systems.sett.s1.xloads.x = [0, 1, 2, 3, 4, 5, 6, 7]
-        inp.systems.sett.s1.xloads.follower_interpolation = [[0.,
-                                                            -3.7e3,
-                                                            -12.1e3,
-                                                            -17.5e3,
-                                                            -39.3e3,
-                                                            -61.0e3,
-                                                            -94.5e3,
-                                                            -120e3]
-                                                            ]
-        inp.systems.sett.s1.t = [1, 2, 3, 4, 5, 6, 7]
+        inp.systems.sett.s1.t1 = self.settings['t1']
+        inp.systems.sett.s1.tn = self.settings['tn']
+        inp.systems.sett.s1.aero.rho_inf = self.settings['rho']
+        inp.systems.sett.s1.aero.u_inf = self.settings['u_inf']
+        inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
+
+        # inp.systems.sett.s1.init_states = dict(q0=q0_init)
+
+        A = np.zeros([3 + len(self.data.linear.rfa['poles']), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
+        A[0, :, :] = self.data.linear.rfa['matrices_q'][0]
+        A[1, :, :] = self.data.linear.rfa['matrices_q'][1]
+
+        n_w = self.data.linear.rfa['matrices_w'][0].shape[1]
+        D = np.zeros([3 + len(self.data.linear.rfa['poles']), self.settings['num_modes'], n_w], dtype=float)
+        D[0, :, :] = self.data.linear.rfa['matrices_w'][0]
+
+        for i_mat in range(len(self.data.linear.rfa['poles'])):
+            A[i_mat+3, :, :] = self.data.linear.rfa['matrices_q'][i_mat+2]
+            D[i_mat+3, :, :] = self.data.linear.rfa['matrices_w'][i_mat+1]
+
+        # dihedral = [] #2
+        # col_points = [] #3
+
+        # for i_surf in range(self.data.aero.n_surf):
+        #     for i_zetax in range(self.data.aero.timestep_info[0].zeta[i_surf].shape[1]-1):
+        #         for i_zetay in range(self.data.aero.timestep_info[0].zeta[i_surf].shape[2]-1):
+        #             col_point = np.zeros(3)
+        #             col_point += self.data.aero.timestep_info[self.settings['use_custom_timestep']]\
+        #                 .zeta[i_surf][:, i_zetax, i_zetay]
+        #             col_point += self.data.aero.timestep_info[self.settings['use_custom_timestep']]\
+        #                 .zeta[i_surf][:, i_zetax+1, i_zetay]
+        #             col_point += self.data.aero.timestep_info[self.settings['use_custom_timestep']]\
+        #                 .zeta[i_surf][:, i_zetax+1, i_zetay+1]
+        #             col_point += self.data.aero.timestep_info[self.settings['use_custom_timestep']]\
+        #                 .zeta[i_surf][:, i_zetax, i_zetay+1]
+        #             col_points.append(col_point/4)
+        #             dihedral.append(1)
+
+        os.mkdir(self.data.case_route + 'roger')
+        np.save(self.data.case_route + 'roger/A.npy', A)
+        # np.save(self.data.case_route + 'roger/D.npy', D)
+        np.save(self.data.case_route + 'roger/poles.npy', self.data.linear.rfa['poles'])
+        # np.save(self.data.case_route + 'roger/col_points.npy', col_points)
+
+        inp.systems.sett.s1.aero.A = self.data.case_route + 'roger/A.npy'
+        # inp.systems.sett.s1.aero.D = self.data.case_route + 'roger/D.npy'
+        inp.systems.sett.s1.aero.poles = self.data.case_route + 'roger/poles.npy'
+
+        # inp.systems.sett.s1.aero.gust_settings.panels_dihedral = dihedral
+        # inp.systems.sett.s1.aero.gust_settings.collocation_points = self.data.case_route + 'roger/col_points.npy'
+
+        inp.systems.sett.s1.xloads.modalaero_forces = self.settings['aero_on']
+        inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
+        
+        # inp.systems.sett.s1.init_states = dict(q1=["axial_parabolic",
+        #                                    ([0., 3., 3., 0., 0., 0], 20.)
+        #                                    ])
+
+        # inp.systems.sett.s1.init_states = dict(q0=q0_init)
 
         return inp
-
+ 
     def intrinsic_output_convert(self, sol):
         pass
+
+    

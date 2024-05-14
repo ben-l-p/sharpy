@@ -113,7 +113,6 @@ snapshots/
 # linear tools / tests cases
 *.prof
 figs/*
-/test_case
 
 \.spyproject/
 

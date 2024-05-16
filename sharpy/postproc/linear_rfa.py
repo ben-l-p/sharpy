@@ -143,7 +143,7 @@ class LinearRFA(BaseSolver):
                             self.settings_default,
                             self.settings_options)
 
-    class RFA:
+    class RFA_obj:
         def __init__(self):
             self.poles = None
             self.k = None
@@ -161,7 +161,7 @@ class LinearRFA(BaseSolver):
             self.err_w = None
 
     def run(self, **kwargs):
-        rfa = self.RFA()                            # Object to hold solution
+        rfa_out = self.RFA_obj()                    # Object to hold solution
         n_ka = self.settings['k_num']               # Number of original spaced frequencies
         n_kb = len(self.settings['k_inf'])          # Number of added frequencies to create a proper residual
         n_k = n_ka + n_kb                           # Total number of frequences
@@ -380,12 +380,12 @@ class LinearRFA(BaseSolver):
                 poles = poles_disc_min
                 [Qq_RFA, Aq_RFA, err_q, R_ls] = least_squares_q(poles)
 
-        rfa.poles = poles
-        rfa.k = k_vals
-        rfa.matrices_q = Aq_RFA
-        rfa.Qq_sample = Qq_sample
-        rfa.Qq_rfa = Qq_RFA
-        rfa.err_q = err_q
+        rfa_out.poles = poles
+        rfa_out.k = k_vals
+        rfa_out.matrices_q = Aq_RFA
+        rfa_out.Qq_sample = Qq_sample
+        rfa_out.Qq_rfa = Qq_RFA
+        rfa_out.err_q = err_q
 
         # Fit gust matrices
         if self.settings['fit_u_gust']:
@@ -427,10 +427,10 @@ class LinearRFA(BaseSolver):
             err_w = np.linalg.norm(np.linalg.norm(np.nan_to_num(np.abs((Qw_RFA - Qw_sample)/Qw_sample)), 'fro', (0, 1)))
             cout.cout_wrap(f"    Averaged relative error: {err_w:4f}", 1)
 
-            rfa.matrices_w = Aw_RFA
-            rfa.Qw_sample = Qw_sample
-            rfa.Qw_rfa = Qw_RFA
-            rfa.err_w = err_w
+            rfa_out.matrices_w = Aw_RFA
+            rfa_out.Qw_sample = Qw_sample
+            rfa_out.Qw_rfa = Qw_RFA
+            rfa_out.err_w = err_w
 
         # Plotting
         if self.settings['plot_rfa']:
@@ -468,5 +468,5 @@ class LinearRFA(BaseSolver):
             plt.show()      
 
         # Save to case data
-        self.data.linear.rfa = rfa        
+        self.data.linear.rfa = rfa_out        
         return self.data

@@ -61,6 +61,22 @@ class IntrinsicSolver(BaseSolver):
     settings_default['dynamic_tstep_init'] = -1
     settings_description['dynamic_tstep_init'] = 'Time step of structure for calculating q0 - doesnt work yet'
 
+    settings_types['stability_analysis'] = 'bool'
+    settings_default['stability_analysis'] = False
+    settings_description['stability_analysis'] = "Sweep through velocitities to determine if solution is stable"
+
+    settings_types['stability_v_min'] = 'float'
+    settings_default['stability_v_min'] = None
+    settings_description['stability_v_min'] = 'Minimum velocity for stability analysis'
+
+    settings_types['stability_v_max'] = 'float'
+    settings_default['stability_v_max'] = None
+    settings_description['stability_v_max'] = 'Maximum velocity for stability analysis'
+
+    settings_types['stability_v_num'] = 'int'
+    settings_default['stability_v_num'] = None
+    settings_description['stability_v_num'] = 'Number of velocities for stability analysis'
+
     # Settings to be passed to FEM4INAS
     settings_types['engine'] = 'str'
     settings_default['engine'] = 'intrinsicmodal'
@@ -154,26 +170,64 @@ class IntrinsicSolver(BaseSolver):
             self.settings = custom_settings
         settings_utils.to_custom_types(self.settings, self.settings_types, self.settings_default)	
 
+    class Intrinsic_Obj:
+        def __init__(self):
+            self.Cab = None
+            self.X1 = None
+            self.X2 = None
+            self.X3 = None
+            self.q = None
+            self.ra = None
+            self.t = None
+            self.stability_analysis = None
+
+        def update_sol(self, sol):
+            self.Cab = np.array(sol.dynamicsystem_s1.Cab)
+            self.X1 = np.array(sol.dynamicsystem_s1.X1)
+            self.X2 = np.array(sol.dynamicsystem_s1.X2)
+            self.X3 = np.array(sol.dynamicsystem_s1.X3)
+            self.q = np.array(sol.dynamicsystem_s1.q)
+            self.ra = np.array(sol.dynamicsystem_s1.ra)
+            self.t = np.array(sol.dynamicsystem_s1.t)
+
     def run(self, **kwargs):
-        FEM_route, evects = self.generate_FEM_files()
-        q0_init = self.q0_init(evects)
-        input = self.generate_settings_file(FEM_route, q0_init)
+        intrinsic_out = self.Intrinsic_Obj()
+        FEM_route = self.generate_FEM_files()
+
+        # Stability analysis
+        if self.settings['stability_analysis']:
+            cout.cout_wrap("Running stability analysis", 0)
+            stab_out = []
+            vels = np.linspace(self.settings['stability_v_min'],
+                               self.settings['stability_v_max'], 
+                               self.settings['stability_v_num'])
+            for vel in vels:
+                input = self.generate_settings_file(FEM_route, float(vel))
+                config = Config(input)
+                cout.cout_wrap(f"\nVelocity: {vel:.2f} m/s", 1)
+                cout.cout_wrap("Running Intrinsic Solver", 0)
+                sol = fem4inas_main.main(input_obj=config)
+                cout.cout_wrap("Intrinsic Solution Complete", 0)
+
+                if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)):
+                    stab_out.append({'u_inf': vel, 'is_stable': False})
+                    cout.cout_wrap("    Stable: False", 1)
+                else:
+                    stab_out.append({'u_inf': vel, 'is_stable': True})
+                    cout.cout_wrap("    Stable: True", 1)
+
+        # Case to save
+        input = self.generate_settings_file(FEM_route, self.settings['u_inf'])
         config = Config(input)
-        cout.cout_wrap("Running FEM4INAS\n")
+        cout.cout_wrap("\nRunning Intrinsic Solver", 0)
         sol = fem4inas_main.main(input_obj=config)
+        cout.cout_wrap("Intrinsic Solution Complete", 0)
 
         if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)):
-            raise ArithmeticError("Solution did not converge, model is unstable.")
+            cout.cout_wrap("    Warning - model is unstable", 1)
 
-        outdict = {'Cab': np.array(sol.dynamicsystem_s1.Cab),
-                   'X1': np.array(sol.dynamicsystem_s1.X1),
-                   'X2': np.array(sol.dynamicsystem_s1.X2),
-                   'X3': np.array(sol.dynamicsystem_s1.X3),
-                   'q': np.array(sol.dynamicsystem_s1.q),
-                   'ra': np.array(sol.dynamicsystem_s1.ra),
-                   't': np.array(sol.dynamicsystem_s1.t)}
-        
-        self.data.intrinsic = outdict
+        intrinsic_out.update_sol(sol)
+        self.data.intrinsic = intrinsic_out
         return self.data
 
     # Returns the global mass and stiffness matrices
@@ -255,18 +309,22 @@ class IntrinsicSolver(BaseSolver):
         f.close()
         
         cout.cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
-        return FEM_route, evects
+        return FEM_route
     
-    def q0_init(self, evects) -> list:
-        tstep_q0 = self.settings['dynamic_tstep_init']
-        n_node = self.data.structure.num_node
-        x0 = self.data.structure.timestep_info[tstep_q0].q[:(n_node-1)*6]
-        q0 = np.linalg.lstsq(evects, x0)[0]
-        return list(q0)
+    # def q0_init(self, evects) -> list:
+    #     tstep_q0 = self.settings['dynamic_tstep_init']
+    #     n_node = self.data.structure.num_node
+    #     x0 = self.data.structure.timestep_info[tstep_q0].q[:(n_node-1)*6]
+    #     q0 = np.linalg.lstsq(evects, x0)[0]
+    #     return list(q0)
 
-    def generate_settings_file(self, FEM_route, q0_init) -> Inputs:
+    def generate_settings_file(self, FEM_route, u_inf) -> Inputs:
         ints_output_folder = self.data.output_folder + 'intrinsic/'
-        os.mkdir(ints_output_folder)
+
+        try:
+            os.mkdir(ints_output_folder)
+        except: 
+            pass
 
         inp = Inputs()
         inp.engine = self.settings['engine']
@@ -289,7 +347,7 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.t1 = self.settings['t1']
         inp.systems.sett.s1.tn = self.settings['tn']
         inp.systems.sett.s1.aero.rho_inf = self.settings['rho']
-        inp.systems.sett.s1.aero.u_inf = self.settings['u_inf']
+        inp.systems.sett.s1.aero.u_inf = u_inf
         inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
         inp.systems.sett.s1.xloads.modalaero_forces = self.settings['aero_on']
         inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
@@ -301,7 +359,11 @@ class IntrinsicSolver(BaseSolver):
         for i_mat in range(len(self.data.linear.rfa.poles)):
             A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
 
-        os.mkdir(self.data.case_route + 'roger')
+        try:
+            os.mkdir(self.data.case_route + 'roger')
+        except:
+            pass
+
         np.save(self.data.case_route + 'roger/poles.npy', -np.array(self.data.linear.rfa.poles))
         np.save(self.data.case_route + 'roger/A.npy', A)
         inp.systems.sett.s1.aero.poles = self.data.case_route + 'roger/poles.npy'

@@ -5,13 +5,14 @@ import matplotlib.pyplot as plt
 import warnings
 import os
 import scipy.io as spio
+import jax.numpy as jnp
 
 # General SHARPy imports
 import sharpy.solvers._basestructural as basestructuralsolver
 from sharpy.utils.solver_interface import solver, BaseSolver
 import sharpy.utils.settings as settings_utils
 import sharpy.structure.utils.xbeamlib as xbeamlib
-from sharpy.utils.cout_utils import cout_wrap
+import sharpy.utils.cout_utils as cout
 
 # FEM4INAS
 from fem4inas import fem4inas_main
@@ -158,16 +159,22 @@ class IntrinsicSolver(BaseSolver):
         q0_init = self.q0_init(evects)
         input = self.generate_settings_file(FEM_route, q0_init)
         config = Config(input)
-        cout_wrap("Running FEM4INAS\n")
+        cout.cout_wrap("Running FEM4INAS\n")
         sol = fem4inas_main.main(input_obj=config)
 
-        int_dict = {'t': np.array(sol.dynamicsystem_s1.t),
-                    'q': np.array(sol.dynamicsystem_s1.q),
-                    'ra': np.array(sol.dynamicsystem_s1.ra)}
+        if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)):
+            raise ArithmeticError("Solution did not converge, model is unstable.")
 
-        spio.savemat('intrinsic_out.mat', int_dict)             #REMOVE
-
-        self.intrinsic_output_convert(sol)
+        outdict = {'Cab': np.array(sol.dynamicsystem_s1.Cab),
+                   'X1': np.array(sol.dynamicsystem_s1.X1),
+                   'X2': np.array(sol.dynamicsystem_s1.X2),
+                   'X3': np.array(sol.dynamicsystem_s1.X3),
+                   'q': np.array(sol.dynamicsystem_s1.q),
+                   'ra': np.array(sol.dynamicsystem_s1.ra),
+                   't': np.array(sol.dynamicsystem_s1.t)}
+        
+        self.data.intrinsic = outdict
+        return self.data
 
     # Returns the global mass and stiffness matrices
     def get_M_C_K(self, n_dof: int, tstep: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -214,7 +221,7 @@ class IntrinsicSolver(BaseSolver):
         return pos, connectivity, beam_number 
 
     def generate_FEM_files(self) -> str:
-        cout_wrap("Generating input FEM data")
+        cout.cout_wrap("Generating input FEM data")
         # Save structure matrices
         n_dof = self.data.structure.num_dof.value
         M_full, C_full, K_full = self.get_M_C_K(n_dof, self.settings['use_custom_timestep'])
@@ -247,7 +254,7 @@ class IntrinsicSolver(BaseSolver):
                 f.write(f"\n{pos[i_node, 0]} {pos[i_node, 1]} {pos[i_node, 2]} {i_node - 1} {node_names[i_node]}")
         f.close()
         
-        cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
+        cout.cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
         return FEM_route, evects
     
     def q0_init(self, evects) -> list:
@@ -288,32 +295,27 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
 
         # Aero due to structure
-        A = np.zeros([3 + len(self.data.linear.rfa['poles']), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
-        A[0, :, :] = self.data.linear.rfa['matrices_q'][0]
-        A[1, :, :] = self.data.linear.rfa['matrices_q'][1]
-        for i_mat in range(len(self.data.linear.rfa['poles'])):
-            A[i_mat+3, :, :] = self.data.linear.rfa['matrices_q'][i_mat+2]
+        A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
+        A[0, :, :] = self.data.linear.rfa.matrices_q[0]
+        A[1, :, :] = self.data.linear.rfa.matrices_q[1]
+        for i_mat in range(len(self.data.linear.rfa.poles)):
+            A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
 
         os.mkdir(self.data.case_route + 'roger')
-        np.save(self.data.case_route + 'roger/poles.npy', -np.array(self.data.linear.rfa['poles']))
+        np.save(self.data.case_route + 'roger/poles.npy', -np.array(self.data.linear.rfa.poles))
         np.save(self.data.case_route + 'roger/A.npy', A)
         inp.systems.sett.s1.aero.poles = self.data.case_route + 'roger/poles.npy'
         inp.systems.sett.s1.aero.A = self.data.case_route + 'roger/A.npy'
 
         # Aero due to disturbances
-        if self.data.linear.rfa['matrices_w'] is not None:
-            n_w = self.data.linear.rfa['matrices_w'][0].shape[1]
-            D = np.zeros([3 + len(self.data.linear.rfa['poles']), self.settings['num_modes'], n_w], dtype=float)
-            D[0, :, :] = self.data.linear.rfa['matrices_w'][0]
-            for i_mat in range(len(self.data.linear.rfa['poles'])):
-                D[i_mat+3, :, :] = self.data.linear.rfa['matrices_w'][i_mat+1]
+        if self.data.linear.rfa.matrices_w is not None:
+            n_w = self.data.linear.rfa.matrices_w[0].shape[1]
+            D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
+            D[0, :, :] = self.data.linear.rfa.matrices_w[0]
+            for i_mat in range(len(self.data.linear.rfa.poles)):
+                D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1]
 
             np.save(self.data.case_route + 'roger/D.npy', D)
             inp.systems.sett.s1.aero.D = self.data.case_route + 'roger/D.npy'
 
         return inp
- 
-    def intrinsic_output_convert(self, sol):
-        pass
-
-    

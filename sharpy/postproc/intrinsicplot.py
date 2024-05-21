@@ -77,6 +77,8 @@ class IntrinsicPlot(BaseSolver):
 
             self.write_aero(i_t)
 
+        return self.data
+
     def write_beam(self, i_t):
         i_t_filename = (self.filename + ('%06u' % i_t) + '.vtu')
 

@@ -102,7 +102,7 @@ class LinearRFA(BaseSolver):
     settings_types['plot_type'] = 'str'
     settings_default['plot_type'] = 'polar'
     settings_description ['plot_type'] = 'Plot RFA'
-    settings_options['plot_type'] = ['bode', 'polar', 'real_imag']
+    settings_options['plot_type'] = ['bode', 'bode_extended', 'polar', 'real_imag']
 
     settings_types['num_q_plot'] = 'int'
     settings_default['num_q_plot'] = 2
@@ -124,6 +124,26 @@ class LinearRFA(BaseSolver):
     settings_types['k_inf'] = 'list(float)'
     settings_default['k_inf'] = []
     settings_description['k_inf'] = 'Adds a point to fit to the residual for each [k_inf, 0]'
+
+    settings_types['pole_duplicate'] = 'bool'
+    settings_default['pole_duplicate']  = True
+    settings_description['pole_duplicate']  = 'Add duplicate offset poles'
+    
+    settings_types['pole_duplicate_offset'] = 'float'
+    settings_default['pole_duplicate_offset'] = -1e5
+    settings_description['pole_duplicate_offset'] = 'Adds a duplicate pole for each original pole shifted by this amount, making the FRF tend to 0 as k -> infinity'
+
+    settings_types['k_extended_min'] = 'float'
+    settings_default['k_extended_min'] = 1e-4
+    settings_description ['k_extended_min'] = 'Minimum reduced frequency for sampling data'
+
+    settings_types['k_extended_max'] = 'float'
+    settings_default['k_extended_max'] = 1e4
+    settings_description ['k_extended_max'] = 'Maximum reduced frequency for sampling data'
+
+    settings_types['k_extended_num'] = 'int'
+    settings_default['k_extended_num'] = 500
+    settings_description ['k_extended_num'] = 'Number of reduced frequency points to sample data'
 
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description, settings_options)
@@ -187,7 +207,8 @@ class LinearRFA(BaseSolver):
             raise AttributeError("Linear state-space system must use 'inout_coords' = 'modes'")
         
         # Ensure frequency range for fitting does not exceed Nyquist frequency
-        cout.cout_wrap(f"Nyquist reduced frequency: k = {1/(2*self.data.linear.ss.dt):2f}")
+        k_nyq = 1/(2*self.data.linear.ss.dt)
+        cout.cout_wrap(f"Nyquist reduced frequency: k = {k_nyq:2f}")
         if self.settings['k_max'] > (1/(2*self.data.linear.ss.dt)+1e-5):
             cout.cout_wrap(     "Warning! Maximum sampling reduced frequency exceeds Nyquist frequency", 2)
 
@@ -257,7 +278,6 @@ class LinearRFA(BaseSolver):
             Aq_RFA = []
             Aq_RFA.append(A0q)
             Aq_RFA.append(D1)
-            Qq_RFA = np.zeros_like(Qq_sample)
 
             R_ls = np.zeros([2*n_k*n_q, n_q*n_p], dtype=float)
             for i_p, pole in enumerate(poles):
@@ -266,45 +286,78 @@ class LinearRFA(BaseSolver):
                     if self.settings['rfa_type'] == 'roger':        
                         R_ls[2*i_k*n_q:(2*i_k+1)*n_q, i_p*n_q:(i_p+1)*n_q] = np.eye(n_q)*k**2/(pole**2 + k**2)
                         R_ls[(2*i_k+1)*n_q:(2*i_k+2)*n_q, i_p*n_q:(i_p+1)*n_q] = np.eye(n_q)*k*pole/(pole**2 + k**2)*self.settings['imag_weight']
+                        if self.settings['pole_duplicate']:
+                            pole_d = pole + self.settings['pole_duplicate_offset']
+                            R_ls[2*i_k*n_q:(2*i_k+1)*n_q, i_p*n_q:(i_p+1)*n_q] -= np.eye(n_q)*k**2/(pole_d**2 + k**2)
+                            R_ls[(2*i_k+1)*n_q:(2*i_k+2)*n_q, i_p*n_q:(i_p+1)*n_q] -= np.eye(n_q)*k*pole_d/(pole_d**2 + k**2)*self.settings['imag_weight']
                     # Lags of form 1/(ik + pole)
                     elif self.settings['rfa_type'] == 'eversman':   
                         R_ls[2*i_k*n_q:(2*i_k+1)*n_q, i_p*n_q:(i_p+1)*n_q] = np.eye(n_q)*pole/(pole**2 + k**2)
                         R_ls[(2*i_k+1)*n_q:(2*i_k+2)*n_q, i_p*n_q:(i_p+1)*n_q] = np.eye(n_q)*-k/(pole**2 + k**2)*self.settings['imag_weight']
+                        if self.settings['pole_duplicate']:
+                            pole_d = pole + self.settings['pole_duplicate_offset']
+                            R_ls[2*i_k*n_q:(2*i_k+1)*n_q, i_p*n_q:(i_p+1)*n_q] -= np.eye(n_q)*pole_d/(pole_d**2 + k**2)
+                            R_ls[(2*i_k+1)*n_q:(2*i_k+2)*n_q, i_p*n_q:(i_p+1)*n_q] -= np.eye(n_q)*-k/(pole_d**2 + k**2)*self.settings['imag_weight']
                     else:
                         raise NotImplementedError
                     
-            try:
-                xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
-                for i_p in range(n_p):
-                    Aq_RFA.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
+            # try:
+            #     xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
+            #     for i_p in range(n_p):
+            #         Aq_RFA.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
 
-                # Sample the generated RFA at given k values
-                for i_k, k in enumerate(k_vals):
-                    Qq_RFA[:, :, i_k] = Aq_RFA[0] + 1j*k*Aq_RFA[1]
-                    for i_p, pole in enumerate(poles):
-                        if self.settings['rfa_type'] == 'roger':
-                            Qq_RFA[:, :, i_k] += Aq_RFA[i_p+2]*1j*k/(1j*k+pole)
-                        elif self.settings['rfa_type'] == 'eversman':
-                            Qq_RFA[:, :, i_k] += Aq_RFA[i_p+2]/(1j*k+pole)
+            #     if self.settings['pole_duplicate']:
+            #         for i_p, pole in enumerate(poles):
+            #             poles.append(pole + self.settings['pole_inf_offset'])
+            #             Aq_RFA.append(-Aq_RFA[i_p+2])
 
-                # Methods of calculating the error in the RFA
-                match self.settings['err_type']:
-                    case 'sum_norm':
-                        errq = np.sum(np.linalg.norm(np.abs((Qq_RFA - Qq_sample)/Qq_sample), 'fro', (0, 1)))/n_k
-                    case 'sum_sum':
-                        errq = np.sum(np.abs((Qq_RFA - Qq_sample)/Qq_sample))/Qq_sample.size
-                    case 'norm_norm':
-                        errq = np.linalg.norm(np.linalg.norm(np.nan_to_num(np.abs((Qq_RFA - Qq_sample)/Qq_sample)), 'fro', (0, 1)))
+            #     Qq_RFA, errq = sample_rfa(poles, Aq_RFA)
+               
+            # # Return a large error if the least squares does not converge
+            # except:
+            #     Qq_RFA = None
+            #     errq = 1e32
+            #     cout.cout_wrap('Combination did not converge', 2)
 
-                # Add additional penalties for large negative and positive poles respectively
-                errq += np.sum(np.abs(poles))*self.settings['minimum_promote']
-                errq += np.sum(np.array(poles) >= 0)*self.settings['force_negative']*1e5
+            xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
+            for i_p in range(n_p):
+                Aq_RFA.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
 
-            # Return a large error if the least squares does not converge
-            except:
-                errq = 1e32
-                cout.cout_wrap('Combination did not converge', 2)
-            return Qq_RFA, Aq_RFA, errq, R_ls
+            poles_new = list(poles)
+            if self.settings['pole_duplicate']:
+                for i_p, pole in enumerate(poles):
+                    poles_new.append(pole + self.settings['pole_duplicate_offset'])
+                    Aq_RFA.append(-Aq_RFA[i_p+2])
+
+            Qq_RFA, errq = sample_rfa(poles_new, Aq_RFA)
+               
+            return Qq_RFA, Aq_RFA, errq, R_ls, poles_new
+
+        def sample_rfa(poles, Aq_RFA):
+            # Sample the generated RFA at given k values
+            Qq_RFA = np.zeros_like(Qq_sample)
+            for i_k, k in enumerate(k_vals):
+                Qq_RFA[:, :, i_k] = Aq_RFA[0] + 1j*k*Aq_RFA[1]
+                for i_p, pole in enumerate(poles):
+                    if self.settings['rfa_type'] == 'roger':
+                        Qq_RFA[:, :, i_k] += Aq_RFA[i_p+2]*1j*k/(1j*k+pole)
+                    elif self.settings['rfa_type'] == 'eversman':
+                        Qq_RFA[:, :, i_k] += Aq_RFA[i_p+2]/(1j*k+pole)
+
+            # Methods of calculating the error in the RFA
+            match self.settings['err_type']:
+                case 'sum_norm':
+                    errq = np.sum(np.linalg.norm(np.abs((Qq_RFA - Qq_sample)/Qq_sample), 'fro', (0, 1)))/n_k
+                case 'sum_sum':
+                    errq = np.sum(np.abs((Qq_RFA - Qq_sample)/Qq_sample))/Qq_sample.size
+                case 'norm_norm':
+                    errq = np.linalg.norm(np.linalg.norm(np.nan_to_num(np.abs((Qq_RFA - Qq_sample)/Qq_sample)), 'fro', (0, 1)))
+
+            # Add additional penalties for large negative and positive poles respectively
+            errq += np.sum(np.abs(poles))*self.settings['minimum_promote']
+            errq += np.sum(np.array(poles) >= 0)*self.settings['force_negative']*1e5
+
+            return Qq_RFA, errq
 
         def least_squares_q_err(poles):
             return least_squares_q(poles)[2]
@@ -313,7 +366,7 @@ class LinearRFA(BaseSolver):
         if len(self.settings['p_input']) != 0:
             poles = self.settings['p_input']
             cout.cout_wrap('Fitting RFA using input poles', 0)
-            [Qq_RFA, Aq_RFA, err_q, R_ls] = least_squares_q(self.settings['p_input'])
+            [Qq_RFA, Aq_RFA, err_q, R_ls, poles] = least_squares_q(self.settings['p_input'])
             cout.cout_wrap(f"    Averaged relative error: {err_q}", 1)
 
         # Pole optimisation
@@ -345,7 +398,7 @@ class LinearRFA(BaseSolver):
             poles_disc_min = np.zeros(n_p)
 
             # Fit an RFA for each n_p combination of the pole library
-            # This can become a large combinatory problem - hence the estimated timer!
+            # This can easily become a large combinatory problem - hence the estimated timer!
             timer_init = time.time()
             i_c_min = 0
             for i_c, poles_comb in enumerate(poles_all_comb):
@@ -361,6 +414,7 @@ class LinearRFA(BaseSolver):
             cout.cout_wrap('    Poles:', 1)
             for pole in poles_disc_min:
                 cout.cout_wrap(f"        {pole:.4f}", 2)
+
             if self.settings['p_spacing'] == 'geometric':
                 cout.cout_wrap(f"    Pole power: {pows[i_c_min]:2f}", 2)
             cout.cout_wrap(f"    Averaged relative error: {errq_min:4f}", 1)
@@ -369,7 +423,7 @@ class LinearRFA(BaseSolver):
             if self.settings['grad_opt']:
                 cout.cout_wrap('Gradient optimisation to fit RFA', 0)
                 poles = list(scipy.optimize.fmin(least_squares_q_err, poles_disc_min))
-                [Qq_RFA, Aq_RFA, err_q, R_ls] = least_squares_q(poles)
+                [Qq_RFA, Aq_RFA, err_q, R_ls, poles] = least_squares_q(poles)
 
                 cout.cout_wrap('    Gradient optimisation complete', 1)
                 cout.cout_wrap('    Poles:', 1)
@@ -378,8 +432,9 @@ class LinearRFA(BaseSolver):
                 cout.cout_wrap(f"    Averaged relative error: {err_q:4f}", 1)
             else:
                 poles = poles_disc_min
-                [Qq_RFA, Aq_RFA, err_q, R_ls] = least_squares_q(poles)
+                [Qq_RFA, Aq_RFA, err_q, R_ls, poles] = least_squares_q(poles)
 
+        # Save to RFA object
         rfa_out.poles = poles
         rfa_out.k = k_vals
         rfa_out.matrices_q = Aq_RFA
@@ -436,18 +491,27 @@ class LinearRFA(BaseSolver):
         if self.settings['plot_rfa']:
             match self.settings['plot_type']:
                 case 'bode':
-                    _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
+                    fig, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
                     for i_q_out in range(self.settings['num_q_plot']):
                         for i_q_in in range(self.settings['num_q_plot']):
                             ax[2*i_q_out, i_q_in].plot(k_vals_a, np.abs(Qq_sample[i_q_out, i_q_in, :n_ka]))
                             ax[2*i_q_out, i_q_in].plot(k_vals_a, np.abs(Qq_RFA[i_q_out, i_q_in, :n_ka]))
                             ax[2*i_q_out, i_q_in].set_xscale('log')
-                            ax[2*i_q_out, i_q_in].set_yscale('log')
+                            # ax[2*i_q_out, i_q_in].set_yscale('log')
                             ax[2*i_q_out+1, i_q_in].plot(k_vals_a, np.angle(Qq_sample[i_q_out, i_q_in, :n_ka]))
                             ax[2*i_q_out+1, i_q_in].plot(k_vals_a, np.angle(Qq_RFA[i_q_out, i_q_in, :n_ka]))
                             ax[2*i_q_out+1, i_q_in].set_xscale('log')
+                            ax[2*i_q_out, i_q_in].set_title(r'$\mathbf{\mathcal{A}}_' + f"{{{i_q_out+1}{i_q_in+1}}}$")
+                            
+                            if i_q_in == 0:
+                                ax[2*i_q_out, i_q_in].set_ylabel(r'Magnitude')
+                                ax[2*i_q_out+1, i_q_in].set_ylabel(r'Phase (rad)')
+
+                            if i_q_out == self.settings['num_q_plot'] - 1:
+                                ax[2*i_q_out+1, i_q_in].set_xlabel(r'Reduced Frequency $k$')
+
                 case 'real_imag':
-                    _, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
+                    fig, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
                     for i_q_out in range(self.settings['num_q_plot']):
                         for i_q_in in range(self.settings['num_q_plot']):
                             ax[2*i_q_out, i_q_in].plot(k_vals_a, np.real(Qq_sample[i_q_out, i_q_in, :n_ka]))
@@ -458,13 +522,77 @@ class LinearRFA(BaseSolver):
                             ax[2*i_q_out+1, i_q_in].plot(k_vals_a, np.imag(Qq_RFA[i_q_out, i_q_in, :n_ka]))
                             ax[2*i_q_out+1, i_q_in].set_xscale('log')
                             ax[2*i_q_out+1, i_q_in].set_yscale('log')
+                            ax[2*i_q_out, i_q_in].set_title(r'$\mathbf{\mathcal{A}}_' + f"{{{i_q_out+1}{i_q_in+1}}}$")
+
+                            if i_q_in == 0:
+                                ax[2*i_q_out, i_q_in].set_ylabel(r'Real')
+                                ax[2*i_q_out+1, i_q_in].set_ylabel(r'Imaginary')
+
+                            if i_q_out == self.settings['num_q_plot'] - 1:
+                                ax[2*i_q_out+1, i_q_in].set_xlabel(r'Reduced Frequency $k$')
                 case 'polar':
-                    _, ax = plt.subplots(self.settings['num_q_plot'], self.settings['num_q_plot'])
+                    fig, ax = plt.subplots(self.settings['num_q_plot'], self.settings['num_q_plot'])
                     for i_q_out in range(self.settings['num_q_plot']):
                         for i_q_in in range(self.settings['num_q_plot']):
                             ax[i_q_out, i_q_in].plot(np.real(Qq_sample[i_q_out, i_q_in, :n_ka]), np.imag(Qq_sample[i_q_out, i_q_in, :n_ka]))
-                            ax[i_q_out, i_q_in].plot(np.real(Qq_RFA[i_q_out, i_q_in, :n_ka]), np.imag(Qq_RFA[i_q_out, i_q_in, :n_ka]))     
+                            ax[i_q_out, i_q_in].plot(np.real(Qq_RFA[i_q_out, i_q_in, :n_ka]), np.imag(Qq_RFA[i_q_out, i_q_in, :n_ka])) 
+                            ax[i_q_out, i_q_in].set_title(r'$\mathbf{\mathcal{A}}_' + f"{{{i_q_out+1}{i_q_in+1}}}$")
+
+                            if i_q_in == 0:
+                                ax[i_q_out, i_q_in].set_ylabel(r'$Im(\mathbf{\mathcal{A}})$')
+
+                            if i_q_out == self.settings['num_q_plot'] - 1:
+                                ax[i_q_out, i_q_in].set_xlabel(r'$Re(\mathbf{\mathcal{A}})$')
+
+                case 'bode_extended':
+                    n_kx = self.settings['k_extended_num']
+                    kx_vals = np.logspace(np.log10(self.settings['k_extended_min']), \
+                                np.log10(self.settings['k_extended_max']), n_kx)
+                    
+                    Qqx_sample = np.zeros([n_q, n_q, n_kx], dtype=complex)
+                    Qqx_RFA = np.zeros_like(Qqx_sample, dtype=complex)
+
+                    for i_k, k in enumerate(kx_vals):
+                        inv_mat = np.linalg.inv(np.eye(n_s)*1j*k-ss_c.A)
+                        inv_mat0 = np.linalg.inv(-ss_c.A)
+                        # Qqx_sample[:, :, i_k] = ss_c.C @ inv_mat @ B0 + D0 + 1j*k*(ss_c.C @ inv_mat @ B1 + D1)
+                        Qqx_sample[:, :, i_k] = ss_c.C @ inv_mat @ B0 + 1j*k*(ss_c.C @ inv_mat @ B1)
+                        Qqx_sample[:, :, i_k] -= ss_c.C @ inv_mat0 @ B0
+
+                        # Qqx_RFA[:, :, i_k] = Aq_RFA[0] + 1j*k*Aq_RFA[1]
+                        for i_p, pole in enumerate(poles):
+                            Qqx_RFA[:, :, i_k] += 1j*k/(1j*k + pole)*Aq_RFA[i_p+2]
+
+                    fig, ax = plt.subplots(2*self.settings['num_q_plot'], self.settings['num_q_plot'], sharex='all')
+                    for i_q_out in range(self.settings['num_q_plot']):
+                        for i_q_in in range(self.settings['num_q_plot']):
+                            ax[2*i_q_out, i_q_in].plot(kx_vals, np.abs(Qqx_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out, i_q_in].plot(kx_vals, np.abs(Qqx_RFA[i_q_out, i_q_in, :]))
+
+                            ax[2*i_q_out, i_q_in].axvline(k_nyq, 
+                                                          np.min(np.abs(Qqx_RFA[i_q_out, i_q_in, :])), 
+                                                          np.max(np.abs(Qqx_RFA[i_q_out, i_q_in, :])),
+                                                          color='k',
+                                                          linestyle='--')
+                                                          
+                            ax[2*i_q_out, i_q_in].set_xscale('log')
+                            ax[2*i_q_out, i_q_in].set_yscale('log')
+                            ax[2*i_q_out+1, i_q_in].plot(kx_vals, np.angle(Qqx_sample[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].plot(kx_vals, np.angle(Qqx_RFA[i_q_out, i_q_in, :]))
+                            ax[2*i_q_out+1, i_q_in].set_xscale('log')
+                            ax[2*i_q_out, i_q_in].set_title(r'$\mathbf{\mathcal{A}}_' + f"{{{i_q_out+1}{i_q_in+1}}}$")
+                            
+                            if i_q_in == 0:
+                                ax[2*i_q_out, i_q_in].set_ylabel(r'Magnitude')
+                                ax[2*i_q_out+1, i_q_in].set_ylabel(r'Phase (rad)')
+
+                            if i_q_out == self.settings['num_q_plot'] - 1:
+                                ax[2*i_q_out+1, i_q_in].set_xlabel(r'Reduced Frequency $k$')
+
             ax[0, 0].legend(["Sampled", "RFA"])
+            fig.align_xlabels()
+            fig.align_ylabels()
+            fig.tight_layout()
             plt.show()      
 
         # Save to case data

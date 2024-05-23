@@ -6,6 +6,7 @@ import warnings
 import os
 import scipy.io as spio
 import jax.numpy as jnp
+import pyyeti
 
 # General SHARPy imports
 import sharpy.solvers._basestructural as basestructuralsolver
@@ -32,6 +33,7 @@ class IntrinsicSolver(BaseSolver):
     settings_types = dict()
     settings_default = dict()
     settings_description = dict()
+    settings_options = dict()
 
     settings_types['print_info'] = 'bool'
     settings_default['print_info'] = True
@@ -40,6 +42,11 @@ class IntrinsicSolver(BaseSolver):
     settings_types['num_modes'] = 'int'
     settings_default['num_modes'] = None
     settings_description['num_modes'] = 'Number of modes to retain'
+
+    settings_types['aero_approx'] = 'str'
+    settings_default['aero_approx'] = 'roger'
+    settings_description['aero_approx'] = 'Aerodynamic model to use.'
+    settings_options['aero_approx'] = ['roger', 'statespace']
 
     settings_types['delta_curved'] = 'float'
     settings_default['delta_curved'] = 1e-2
@@ -76,6 +83,11 @@ class IntrinsicSolver(BaseSolver):
     settings_types['stability_v_num'] = 'int'
     settings_default['stability_v_num'] = None
     settings_description['stability_v_num'] = 'Number of velocities for stability analysis'
+
+    settings_types['d2c_method'] = 'str'
+    settings_default['d2c_method'] = 'foh'
+    settings_description ['d2c_method'] = 'Method for converting state space from discrete to continuous time'
+    settings_options['d2c_method'] = ['zoh', 'zoha', 'foh', 'tustin']
 
     # Settings to be passed to FEM4INAS
     settings_types['engine'] = 'str'
@@ -153,6 +165,10 @@ class IntrinsicSolver(BaseSolver):
     settings_types['aero_on'] = 'bool'
     settings_default['aero_on'] = True
     settings_description['aero_on'] = 'Enable aerodynamics'
+
+    settings_types['gust_on'] = 'bool'
+    settings_default['gust_on'] = False
+    settings_description['gust_on'] = 'Enable gusts'
 
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
@@ -351,33 +367,78 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
         inp.systems.sett.s1.xloads.modalaero_forces = self.settings['aero_on']
         inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
+        inp.systems.sett.s1.bc1 = 'clamped'
 
-        # Aero due to structure
-        A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
-        A[0, :, :] = self.data.linear.rfa.matrices_q[0]
-        A[1, :, :] = self.data.linear.rfa.matrices_q[1]
-        for i_mat in range(len(self.data.linear.rfa.poles)):
-            A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
-
-        try:
-            os.mkdir(self.data.case_route + 'roger')
-        except:
-            pass
-
-        np.save(self.data.case_route + 'roger/poles.npy', -np.array(self.data.linear.rfa.poles))
-        np.save(self.data.case_route + 'roger/A.npy', A)
-        inp.systems.sett.s1.aero.poles = self.data.case_route + 'roger/poles.npy'
-        inp.systems.sett.s1.aero.A = self.data.case_route + 'roger/A.npy'
-
-        # Aero due to disturbances
-        if self.data.linear.rfa.matrices_w is not None:
-            n_w = self.data.linear.rfa.matrices_w[0].shape[1]
-            D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
-            D[0, :, :] = self.data.linear.rfa.matrices_w[0]
+        if self.settings['aero_approx'] == 'roger':
+            # Aero due to structure
+            A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
+            A[0, :, :] = self.data.linear.rfa.matrices_q[0]
+            A[1, :, :] = self.data.linear.rfa.matrices_q[1]
             for i_mat in range(len(self.data.linear.rfa.poles)):
-                D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1]
+                A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
 
-            np.save(self.data.case_route + 'roger/D.npy', D)
-            inp.systems.sett.s1.aero.D = self.data.case_route + 'roger/D.npy'
+            inp.systems.sett.s1.aero.poles = -jnp.array(self.data.linear.rfa.poles)
+            inp.systems.sett.s1.aero.A = jnp.array(A)
+
+            # Aero due to disturbances
+            if self.data.linear.rfa.matrices_w is not None and self.settings['gust_on']:
+                n_w = self.data.linear.rfa.matrices_w[0].shape[1]
+                D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
+                D[0, :, :] = self.data.linear.rfa.matrices_w[0]
+                for i_mat in range(len(self.data.linear.rfa.poles)):
+                    D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1]
+
+                inp.systems.sett.s1.aero.A = jnp.array(D)
+
+        elif self.settings['aero_approx'] == 'statespace':
+            # Remove structural states
+            states_keep = []
+            for i_s in range(self.data.linear.ss.state_variables.num_variables):
+                if self.data.linear.ss.state_variables.vector_variables[i_s].name not in ['q', 'q_dot']:
+                    states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
+            
+            # Remove non-forcing outputs
+            outputs_keep = []
+            for i_s in range(self.data.linear.ss.output_variables.num_variables):
+                if self.data.linear.ss.output_variables.vector_variables[i_s].name == 'Q':
+                    outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
+
+            # Truncate states and outputs
+            ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(states_keep, states_keep)], \
+                                    self.data.linear.ss.B[states_keep, :], \
+                                    self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)], \
+                                    self.data.linear.ss.D[outputs_keep, :], \
+                                    self.data.linear.ss.dt)
+            
+            # Convert to continuous time state space model
+            ss_c = ss_d_trunc.d2c(self.settings['d2c_method'])
+
+            # Split into three state space systems for each input
+            # The A and C matrices are constant between the three
+            for i_s in range(self.data.linear.ss.input_variables.num_variables):
+                var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
+                param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
+                match var_name:
+                    case 'q':
+                        B0 = ss_c.B[:, param_index]
+                        D0 = ss_c.D[:, param_index]
+                    case 'q_dot':
+                        B1 = ss_c.B[:, param_index]
+                        D1 = ss_c.D[:, param_index]
+                    case 'u_gust':
+                        Bw = ss_c.B[:, param_index]
+                        Dw = ss_c.D[:, param_index]
+            
+            # Input order is [A, B0, B1, Bw, C, D0, D1, Dw]
+            inp.systems.sett.s1.aero.approx = 'statespace'
+            inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A)
+            inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0)
+            inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1)
+            inp.systems.sett.s1.aero.ss_C = jnp.array(ss_c.C)
+            inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0)
+            inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1)
+            if self.settings['gust_on']:
+                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw)
+                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw)
 
         return inp

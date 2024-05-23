@@ -158,6 +158,10 @@ class IntrinsicSolver(BaseSolver):
     settings_default['c_ref'] = None
     settings_description['c_ref'] = 'Reference chord (m)'
 
+    settings_types['reduced_time_ss'] = 'bool'
+    settings_default['reduced_time_ss'] = True
+    settings_description['reduced_time_ss'] = "True for state space system in terms of reduced time, false for in terms of real time"
+
     settings_types['gravity_on'] = 'bool'
     settings_default['gravity_on'] = True
     settings_description['gravity_on'] = 'Enable gravity'
@@ -326,13 +330,6 @@ class IntrinsicSolver(BaseSolver):
         
         cout.cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
         return FEM_route
-    
-    # def q0_init(self, evects) -> list:
-    #     tstep_q0 = self.settings['dynamic_tstep_init']
-    #     n_node = self.data.structure.num_node
-    #     x0 = self.data.structure.timestep_info[tstep_q0].q[:(n_node-1)*6]
-    #     q0 = np.linalg.lstsq(evects, x0)[0]
-    #     return list(q0)
 
     def generate_settings_file(self, FEM_route, u_inf) -> Inputs:
         ints_output_folder = self.data.output_folder + 'intrinsic/'
@@ -370,6 +367,9 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.bc1 = 'clamped'
 
         if self.settings['aero_approx'] == 'roger':
+            if not hasattr(self.data.linear, 'rfa'):
+                raise AttributeError("RFA postproccesor needs to be run")
+            
             # Aero due to structure
             A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
             A[0, :, :] = self.data.linear.rfa.matrices_q[0]
@@ -428,17 +428,22 @@ class IntrinsicSolver(BaseSolver):
                     case 'u_gust':
                         Bw = ss_c.B[:, param_index]
                         Dw = ss_c.D[:, param_index]
+
+            # import scipy.io as spio
+            # spio.savemat("A_test.mat", {"Ac": ss_c.A, "Ad": ss_d_trunc.A})
+            # pass
             
             # Input order is [A, B0, B1, Bw, C, D0, D1, Dw]
             inp.systems.sett.s1.aero.approx = 'statespace'
-            inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A)
-            inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0)
-            inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1)
-            inp.systems.sett.s1.aero.ss_C = jnp.array(ss_c.C)
-            inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0)
-            inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1)
+            inp.systems.sett.s1.aero.use_reduced_time = self.settings['reduced_time_ss']
+            inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A, dtype=float)
+            inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0, dtype=float)
+            inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1, dtype=float)
+            inp.systems.sett.s1.aero.ss_C = jnp.array(ss_c.C, dtype=float)
+            inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0, dtype=float)
+            inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1, dtype=float)
             if self.settings['gust_on']:
-                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw)
-                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw)
+                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw, dtype=float)
+                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw, dtype=float)
 
         return inp

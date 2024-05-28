@@ -7,6 +7,7 @@ import os
 import scipy.io as spio
 import jax.numpy as jnp
 import pyyeti
+import typing
 
 # General SHARPy imports
 import sharpy.solvers._basestructural as basestructuralsolver
@@ -14,6 +15,7 @@ from sharpy.utils.solver_interface import solver, BaseSolver
 import sharpy.utils.settings as settings_utils
 import sharpy.structure.utils.xbeamlib as xbeamlib
 import sharpy.utils.cout_utils as cout
+import sharpy.presharpy.presharpy
 
 # FEM4INAS
 from fem4inas import fem4inas_main
@@ -46,7 +48,7 @@ class IntrinsicSolver(BaseSolver):
     settings_types['aero_approx'] = 'str'
     settings_default['aero_approx'] = 'roger'
     settings_description['aero_approx'] = 'Aerodynamic model to use.'
-    settings_options['aero_approx'] = ['roger', 'statespace']
+    settings_options['aero_approx'] = ['roger', 'statespace', 'none']
 
     settings_types['delta_curved'] = 'float'
     settings_default['delta_curved'] = 1e-2
@@ -89,7 +91,22 @@ class IntrinsicSolver(BaseSolver):
     settings_description ['d2c_method'] = 'Method for converting state space from discrete to continuous time'
     settings_options['d2c_method'] = ['zoh', 'zoha', 'foh', 'tustin']
 
-    # Settings to be passed to FEM4INAS
+    settings_types['gust_intensity'] = 'float'
+    settings_default['gust_intensity'] = 0.0
+    settings_description['gust_intensity'] = 'yes'
+
+    settings_types['gust_length'] = 'float'
+    settings_default['gust_length'] = 0.0
+    settings_description['gust_length'] = 'yes'
+
+    settings_types['gust_num_x'] = 'int'
+    settings_default['gust_num_x'] = 0
+    settings_description['gust_num_x'] = 'yes'
+
+    settings_types['gust_offset'] = 'float'
+    settings_default['gust_offset'] = 0.0
+    settings_description['gust_offset'] = 'yes'
+
     settings_types['engine'] = 'str'
     settings_default['engine'] = 'intrinsicmodal'
     settings_description['engine'] = 'Engine to be used in FEM4INAS'
@@ -143,8 +160,12 @@ class IntrinsicSolver(BaseSolver):
     settings_description['t1'] = 'Simulation time (s)'
 
     settings_types['tn'] = 'int'
-    settings_default['tn'] = None
+    settings_default['tn'] = 10000
     settings_description['tn'] = 'Number of simulation steps'
+
+    settings_types['t_factor'] = 'float'
+    settings_default['t_factor'] = None
+    settings_description['t_factor'] = 'Multiple of Nyquist step size for highest frequency mode to use. Set to -1 to be disabled and set number of steps using tn'
 
     settings_types['rho'] = 'float'
     settings_default['rho'] = None
@@ -181,7 +202,7 @@ class IntrinsicSolver(BaseSolver):
         self.data = None
         self.settings = None
 
-    def initialise(self, data, custom_settings=None, restart=False):
+    def initialise(self, data: sharpy.presharpy.presharpy.PreSharpy, custom_settings=None, restart=False):
         # Load solver settings
         self.data = data
         if custom_settings is None:
@@ -210,8 +231,10 @@ class IntrinsicSolver(BaseSolver):
             self.ra = np.array(sol.dynamicsystem_s1.ra)
             self.t = np.array(sol.dynamicsystem_s1.t)
 
-    def run(self, **kwargs):
+    def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
         intrinsic_out = self.Intrinsic_Obj()
+        self.get_M_C_K(self.settings['use_custom_timestep'])
+        self.get_eigs0()
         FEM_route = self.generate_FEM_files()
 
         # Stability analysis
@@ -251,30 +274,34 @@ class IntrinsicSolver(BaseSolver):
         return self.data
 
     # Returns the global mass and stiffness matrices
-    def get_M_C_K(self, n_dof: int, tstep: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        M_full = np.zeros([n_dof, n_dof],
+    def get_M_C_K(self, tstep: int) -> None:
+        self.n_dof = self.data.structure.num_dof.value
+
+        M_full = np.zeros([self.n_dof, self.n_dof],
                             dtype=ct.c_double, order='F')
-        C_full = np.zeros([n_dof, n_dof],
+        C_full = np.zeros([self.n_dof, self.n_dof],
                             dtype=ct.c_double, order='F')
-        K_full = np.zeros([n_dof, n_dof],
+        K_full = np.zeros([self.n_dof, self.n_dof],
                             dtype=ct.c_double, order='F')
 
         xbeamlib.cbeam3_solv_modal(self.data.structure, self.settings, tstep,
                                         M_full, C_full, K_full)
 
-        return np.array(M_full), np.array(C_full), np.array(K_full)
+        self.M = np.array(M_full)
+        self.C = np.array(C_full)
+        self.K = np.array(K_full)
 
     # Returns the eigenvalues and eigenvectors of the system
-    def get_eigs0(self, n_dof, M_full, C_full, K_full) -> tuple[np.ndarray, np.ndarray]:
+    def get_eigs0(self) -> None:
         # Check if the system has damping
-        if np.max(np.abs(C_full)) > np.finfo(float).eps:
+        if np.max(np.abs(self.C)) > np.finfo(float).eps:
             warnings.warn('Projecting a system with damping on undamped modal shapes')
 
         # Solve eigen problem (no damping)
-        [evals,evects] = np.linalg.eig(np.linalg.solve(M_full, K_full))
+        [evals,evects] = np.linalg.eig(np.linalg.solve(self.M, self.K))
 
         # Sort eigenvalues/vectors in frequency order
-        NumLambda = min(n_dof, int(self.settings['num_modes']))
+        NumLambda = min(self.n_dof, int(self.settings['num_modes']))
         order = np.argsort(np.sqrt(evals/1j))[:NumLambda]
         evals = evals[order]
         evects = evects[:,order]
@@ -285,7 +312,8 @@ class IntrinsicSolver(BaseSolver):
             plt.scatter(np.zeros_like(evals), evals)
             plt.show()
 
-        return evals, evects
+        self.evals = evals
+        self.evects = evects
 
     # Returns the grid nodes of the system
     def get_grid(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -297,16 +325,13 @@ class IntrinsicSolver(BaseSolver):
     def generate_FEM_files(self) -> str:
         cout.cout_wrap("Generating input FEM data")
         # Save structure matrices
-        n_dof = self.data.structure.num_dof.value
-        M_full, C_full, K_full = self.get_M_C_K(n_dof, self.settings['use_custom_timestep'])
-        evals, evects = self.get_eigs0(n_dof, M_full, C_full, K_full)
 
         FEM_route = self.data.case_route + 'intrinsic_FEM/'
         os.mkdir(FEM_route)
-        np.save(FEM_route + 'Ma', M_full)
-        np.save(FEM_route + 'Ka', K_full)
-        np.save(FEM_route + 'eigenvecs', evects)
-        np.save(FEM_route + 'eigenvals', evals)
+        np.save(FEM_route + 'Ma', self.M)
+        np.save(FEM_route + 'Ka', self.K)
+        np.save(FEM_route + 'eigenvecs', self.evects)
+        np.save(FEM_route + 'eigenvals', self.evals)
 
         # Create structural grid
         pos, connectivity, beam_number = self.get_grid()
@@ -331,6 +356,29 @@ class IntrinsicSolver(BaseSolver):
         cout.cout_wrap(f'\tFEM files generated in {FEM_route}', 1)
         return FEM_route
 
+    def calculate_collocation_dihedral(self):
+        col = []
+        dih = []
+
+        otp = np.zeros(3)
+
+        ts_data = self.data.aero.timestep_info[self.settings['use_custom_timestep']]
+        # for surf in ts_data.zeta:
+        #     for i_N in range(surf.shape[2]-1):
+        #         for i_M in range(surf.shape[1]-1):
+        #             col.append(0.25*(surf[:, i_M, i_N]
+        #                                    +surf[:, i_M+1, i_N]
+        #                                    +surf[:, i_M+1, i_N+1]
+        #                                    +surf[:, i_M, i_N+1]))
+        #             dih.append([1.0])      # TODO: optimise this code and add dihedral
+        for surf in ts_data.zeta:
+            for i_N in range(surf.shape[2]):
+                for i_M in range(surf.shape[1]):
+                    col.append([surf[0, i_M, i_N], surf[1, i_M, i_N], surf[2, i_M, i_N]])
+                    dih.append([1.0,])      # TODO: optimise this code and add dihedral
+
+        return col, dih
+
     def generate_settings_file(self, FEM_route, u_inf) -> Inputs:
         ints_output_folder = self.data.output_folder + 'intrinsic/'
 
@@ -341,7 +389,8 @@ class IntrinsicSolver(BaseSolver):
 
         inp = Inputs()
         inp.engine = self.settings['engine']
-        inp.fem.connectivity = dict(A=['B'], B = None)             #TODO: replace with connectivity
+        # inp.fem.connectivity = dict(A=['B'], B = None)             #TODO: replace with connectivity
+        inp.fem.connectivity = dict(A=None)
         inp.fem.folder = FEM_route
         inp.fem.num_modes = self.settings['num_modes']
         inp.driver.typeof = self.settings['driver']
@@ -355,10 +404,11 @@ class IntrinsicSolver(BaseSolver):
                                                     atol=self.settings['atol'],
                                                     max_steps=self.settings['max_steps'],
                                                     norm=self.settings['norm'],
-                                                    kappa=self.settings['kappa'])
+                                                    kappa=self.settings['kappa'],
+                                                    stepsize_controller=dict(PIDController=dict(atol=1e-5,rtol=1e-5)))
         
         inp.systems.sett.s1.t1 = self.settings['t1']
-        inp.systems.sett.s1.tn = self.settings['tn']
+
         inp.systems.sett.s1.aero.rho_inf = self.settings['rho']
         inp.systems.sett.s1.aero.u_inf = u_inf
         inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
@@ -382,13 +432,29 @@ class IntrinsicSolver(BaseSolver):
 
             # Aero due to disturbances
             if self.data.linear.rfa.matrices_w is not None and self.settings['gust_on']:
-                n_w = self.data.linear.rfa.matrices_w[0].shape[1]
-                D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
-                D[0, :, :] = self.data.linear.rfa.matrices_w[0]
-                for i_mat in range(len(self.data.linear.rfa.poles)):
-                    D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1]
+                # n_w = self.data.linear.rfa.matrices_w[0].shape[1]
+                # D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
+                # D[0, :, :] = self.data.linear.rfa.matrices_w[0]
+                # for i_mat in range(len(self.data.linear.rfa.poles)):
+                #     D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1]
 
-                inp.systems.sett.s1.aero.A = jnp.array(D)
+                n_w = int(self.data.linear.rfa.matrices_w[0].shape[1]/3)
+                D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
+                D[0, :, :] = self.data.linear.rfa.matrices_w[0][:, ::3]
+                for i_mat in range(len(self.data.linear.rfa.poles)):
+                    D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1][:, ::3]
+
+                inp.systems.sett.s1.aero.D = jnp.array(D)
+
+                inp.systems.sett.s1.aero.gust_profile = "mc"
+                inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
+                inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
+                inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
+                inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
+
+                col, dih = self.calculate_collocation_dihedral()
+                inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
+                inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
 
         elif self.settings['aero_approx'] == 'statespace':
             # Remove structural states
@@ -428,12 +494,7 @@ class IntrinsicSolver(BaseSolver):
                     case 'u_gust':
                         Bw = ss_c.B[:, param_index]
                         Dw = ss_c.D[:, param_index]
-
-            # import scipy.io as spio
-            # spio.savemat("A_test.mat", {"Ac": ss_c.A, "Ad": ss_d_trunc.A})
-            # pass
             
-            # Input order is [A, B0, B1, Bw, C, D0, D1, Dw]
             inp.systems.sett.s1.aero.approx = 'statespace'
             inp.systems.sett.s1.aero.use_reduced_time = self.settings['reduced_time_ss']
             inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A, dtype=float)
@@ -445,5 +506,19 @@ class IntrinsicSolver(BaseSolver):
             if self.settings['gust_on']:
                 inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw, dtype=float)
                 inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw, dtype=float)
+
+        # Number of time steps
+        if self.settings['t_factor'] == -1:
+            tn = self.settings['tn']
+        elif self.settings['aero_approx'] == 'statespace':
+            tn_struct = int(2*np.power(np.max(self.evals), 0.5))
+            tn_aero = int(np.max(np.linalg.eig(ss_c.A)[0].imag)*(2*u_inf)/self.settings['c_ref'])
+            cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
+            cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
+            tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
+        else:
+            tn = int(2*np.power(np.max(self.evals), 0.5)*self.settings['t_factor']*self.settings['t1'])
+        inp.systems.sett.s1.tn = tn
+        cout.cout_wrap(f"Number of time steps: {tn}", 0)
 
         return inp

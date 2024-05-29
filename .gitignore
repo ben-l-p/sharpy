@@ -126,3 +126,4 @@ figs/*
 # MATLAB data files
 *.mat
 *.bmp
+*.m

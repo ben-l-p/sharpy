@@ -8,6 +8,7 @@ import scipy.io as spio
 import jax.numpy as jnp
 import pyyeti
 import typing
+import scipy.linalg as spla
 
 # General SHARPy imports
 import sharpy.solvers._basestructural as basestructuralsolver
@@ -164,7 +165,7 @@ class IntrinsicSolver(BaseSolver):
     settings_description['tn'] = 'Number of simulation steps'
 
     settings_types['t_factor'] = 'float'
-    settings_default['t_factor'] = None
+    settings_default['t_factor'] = -1.0
     settings_description['t_factor'] = 'Multiple of Nyquist step size for highest frequency mode to use. Set to -1 to be disabled and set number of steps using tn'
 
     settings_types['rho'] = 'float'
@@ -233,8 +234,8 @@ class IntrinsicSolver(BaseSolver):
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
         intrinsic_out = self.Intrinsic_Obj()
-        self.get_M_C_K(self.settings['use_custom_timestep'])
-        self.get_eigs0()
+        # self.get_M_C_K(self.settings['use_custom_timestep'])
+        # self.get_eigs0()
         self.get_grid()
 
         # Stability analysis
@@ -252,7 +253,7 @@ class IntrinsicSolver(BaseSolver):
                 sol = fem4inas_main.main(input_obj=config)
                 cout.cout_wrap("Intrinsic Solution Complete", 0)
 
-                if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)):
+                if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)) or jnp.any(jnp.isinf(sol.dynamicsystem_s1.q)):
                     stab_out.append({'u_inf': vel, 'is_stable': False})
                     cout.cout_wrap("    Stable: False", 1)
                 else:
@@ -266,50 +267,14 @@ class IntrinsicSolver(BaseSolver):
         sol = fem4inas_main.main(input_obj=config)
         cout.cout_wrap("Intrinsic Solution Complete", 0)
 
-        if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)):
+        if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)) or jnp.any(jnp.isinf(sol.dynamicsystem_s1.q)):
             cout.cout_wrap("    Warning - model is unstable", 1)
 
         intrinsic_out.update_sol(sol)
         self.data.intrinsic = intrinsic_out
+
+
         return self.data
-
-    # Returns the global mass and stiffness matrices
-    def get_M_C_K(self, tstep: int) -> None:
-        self.n_dof = self.data.structure.num_dof.value
-
-        self.M = np.zeros([self.n_dof, self.n_dof],
-                            dtype=ct.c_double, order='F')
-        self.C = np.zeros([self.n_dof, self.n_dof],
-                            dtype=ct.c_double, order='F')
-        self.K = np.zeros([self.n_dof, self.n_dof],
-                            dtype=ct.c_double, order='F')
-
-        xbeamlib.cbeam3_solv_modal(self.data.structure, self.settings, tstep,
-                                        self.M, self.C, self.K)
-
-    # Returns the eigenvalues and eigenvectors of the system
-    def get_eigs0(self) -> None:
-        # Check if the system has damping
-        if np.max(np.abs(self.C)) > np.finfo(float).eps:
-            warnings.warn('Projecting a system with damping on undamped modal shapes')
-
-        # Solve eigen problem (no damping)
-        [evals,evects] = np.linalg.eig(np.linalg.solve(self.M, self.K))
-
-        # Sort eigenvalues/vectors in frequency order
-        NumLambda = min(self.n_dof, int(self.settings['num_modes']))
-        order = np.argsort(np.sqrt(evals/1j))[:NumLambda]
-        evals = evals[order]
-        evects = evects[:,order]
-
-        # Plot eigenvalues using matplotlib if specified in settings
-        if self.settings['plot_eigenvalues']:
-            plt.figure()
-            plt.scatter(np.zeros_like(evals), evals)
-            plt.show()
-
-        self.evals = evals
-        self.evects = evects
 
     # Returns the grid of the system
     def get_grid(self) -> None:
@@ -323,6 +288,11 @@ class IntrinsicSolver(BaseSolver):
 
         # Create grid
         self.X = self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos
+
+        # self.X = np.array([self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 1],
+        #             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 0],
+        #             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 2]]).T
+
         self.conn = self.data.structure.connectivities
         self.beam_number = self.data.structure.beam_number
 
@@ -371,15 +341,24 @@ class IntrinsicSolver(BaseSolver):
 
         # FEM Inputs
         inp.fem.connectivity = dict(A=None)             #TODO: replace with connectivity
-        inp.fem.Ka = jnp.array(self.K)
-        inp.fem.Ma = jnp.array(self.M)
+
+        M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
+        K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
+
+        (evals, evects) = np.linalg.eig(K @ np.linalg.inv(M))
+        evals.sort()
+
+        inp.fem.Ka = jnp.array(K)
+        inp.fem.Ma = jnp.array(M)
+        
         inp.fem.num_modes = self.settings['num_modes']
-        inp.fem.eigenvals = jnp.array(self.evals)
-        inp.fem.eigenvecs = jnp.array(self.evects)
+
+        # inp.fem.eig_type = "inputs"
         inp.fem.X = jnp.array(self.X)
         inp.fem.component_vect = self.node_names
         inp.fem.fe_order = self.node_numbers
         inp.fem.grid = None
+        inp.fem.eig_names = None
 
         # Roger aero inputs
         if self.settings['aero_approx'] == 'roger' and self.settings['aero_on']:
@@ -514,16 +493,16 @@ class IntrinsicSolver(BaseSolver):
                 inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
 
         # Determine number of time steps
-        if self.settings['t_factor'] == -1:
+        if self.settings['t_factor'] <= 0.0:
             tn = self.settings['tn']
         elif self.settings['aero_approx'] == 'statespace':
-            tn_struct = int(2*np.power(np.max(self.evals), 0.5))
+            tn_struct = int(2*np.sqrt(evals[self.settings['num_modes']-1]))
             tn_aero = int(np.max(np.linalg.eig(ss_c.A)[0].imag)*(2*u_inf)/self.settings['c_ref'])
             cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
             cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
             tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
         else:
-            tn = int(2*np.power(np.max(self.evals), 0.5)*self.settings['t_factor']*self.settings['t1'])
+            tn = int(2*np.sqrt(evals[self.settings['num_modes']-1])*self.settings['t_factor']*self.settings['t1'])
         inp.systems.sett.s1.tn = tn
         cout.cout_wrap(f"Number of time steps: {tn}", 0)
 

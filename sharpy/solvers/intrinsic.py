@@ -1,20 +1,12 @@
 # Python package imports
 import numpy as np
-import ctypes as ct
-import matplotlib.pyplot as plt
-import warnings
-import os
-import scipy.io as spio
 import jax.numpy as jnp
 import pyyeti
 import typing
-import scipy.linalg as spla
 
 # General SHARPy imports
-import sharpy.solvers._basestructural as basestructuralsolver
 from sharpy.utils.solver_interface import solver, BaseSolver
 import sharpy.utils.settings as settings_utils
-import sharpy.structure.utils.xbeamlib as xbeamlib
 import sharpy.utils.cout_utils as cout
 import sharpy.presharpy.presharpy
 
@@ -345,9 +337,6 @@ class IntrinsicSolver(BaseSolver):
         M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
         K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
 
-        (evals, evects) = np.linalg.eig(K @ np.linalg.inv(M))
-        evals.sort()
-
         inp.fem.Ka = jnp.array(K)
         inp.fem.Ma = jnp.array(M)
         
@@ -493,16 +482,23 @@ class IntrinsicSolver(BaseSolver):
                 inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
 
         # Determine number of time steps
-        if self.settings['t_factor'] <= 0.0:
+        if self.settings['tn'] > 0:     # Set number of steps from input
             tn = self.settings['tn']
-        elif self.settings['aero_approx'] == 'statespace':
-            tn_struct = int(2*np.sqrt(evals[self.settings['num_modes']-1]))
-            tn_aero = int(np.max(np.linalg.eig(ss_c.A)[0].imag)*(2*u_inf)/self.settings['c_ref'])
-            cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
-            cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
-            tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
-        else:
-            tn = int(2*np.sqrt(evals[self.settings['num_modes']-1])*self.settings['t_factor']*self.settings['t1'])
+        else:                           # Set number of steps from eigenvalues
+            (evals, _) = np.linalg.eig(K @ np.linalg.inv(M))
+            evals.sort()
+
+            if self.settings['aero_approx'] == 'roger':
+                tn = int(2*np.sqrt(evals[self.settings['num_modes']-1])*self.settings['t_factor']*self.settings['t1'])
+            elif self.settings['aero_approx'] == 'statespace':
+                tn_struct = int(2*np.sqrt(evals[self.settings['num_modes']-1]))
+                tn_aero = int(np.max(np.linalg.eig(ss_c.A)[0].imag)*(2*u_inf)/self.settings['c_ref'])
+                cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
+                cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
+                tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
+            else:
+                raise AttributeError
+
         inp.systems.sett.s1.tn = tn
         cout.cout_wrap(f"Number of time steps: {tn}", 0)
 

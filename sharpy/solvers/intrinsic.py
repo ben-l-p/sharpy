@@ -172,9 +172,9 @@ class IntrinsicSolver(BaseSolver):
     settings_default['c_ref'] = None
     settings_description['c_ref'] = 'Reference chord (m)'
 
-    settings_types['reduced_time_ss'] = 'bool'
-    settings_default['reduced_time_ss'] = True
-    settings_description['reduced_time_ss'] = "True for state space system in terms of reduced time, false for in terms of real time"
+    # settings_types['reduced_time_ss'] = 'bool'
+    # settings_default['reduced_time_ss'] = True
+    # settings_description['reduced_time_ss'] = "True for state space system in terms of reduced time, false for in terms of real time"
 
     settings_types['gravity_on'] = 'bool'
     settings_default['gravity_on'] = True
@@ -226,8 +226,6 @@ class IntrinsicSolver(BaseSolver):
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
         intrinsic_out = self.Intrinsic_Obj()
-        # self.get_M_C_K(self.settings['use_custom_timestep'])
-        # self.get_eigs0()
         self.get_grid()
 
         # Stability analysis
@@ -280,10 +278,6 @@ class IntrinsicSolver(BaseSolver):
 
         # Create grid
         self.X = self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos
-
-        # self.X = np.array([self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 1],
-        #             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 0],
-        #             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos[:, 2]]).T
 
         self.conn = self.data.structure.connectivities
         self.beam_number = self.data.structure.beam_number
@@ -401,7 +395,10 @@ class IntrinsicSolver(BaseSolver):
                 inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
 
         # Statespace aero inputs
+        # The state space system is given in dimensional time
         elif self.settings['aero_approx'] == 'statespace' and self.settings['aero_on']:
+            scaling_dict = self.data.settings['LinearAssembler']['linear_system_settings']['aero_settings']['ScalingDict']
+
             # Remove structural states
             states_keep = []
             for i_s in range(self.data.linear.ss.state_variables.num_variables):
@@ -431,7 +428,7 @@ class IntrinsicSolver(BaseSolver):
                 param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
                 match var_name:
                     case 'q':
-                        B0 = ss_c.B[:, param_index]
+                        B0 = ss_c.B[:, param_index] 
                         D0 = ss_c.D[:, param_index]
                     case 'q_dot':
                         B1 = ss_c.B[:, param_index]
@@ -441,7 +438,6 @@ class IntrinsicSolver(BaseSolver):
                         Dw = ss_c.D[:, param_index]
             
             inp.systems.sett.s1.aero.approx = 'statespace'
-            inp.systems.sett.s1.aero.use_reduced_time = self.settings['reduced_time_ss']
             inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A, dtype=float)
             inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0, dtype=float)
             inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1, dtype=float)

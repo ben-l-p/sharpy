@@ -145,6 +145,10 @@ class LinearRFA(BaseSolver):
     settings_default['k_extended_num'] = 500
     settings_description ['k_extended_num'] = 'Number of reduced frequency points to sample data'
 
+    settings_types['ScalingDict'] = 'dict'
+    settings_default['ScalingDict'] = {'length': 1.0, 'speed': 1.0, 'density': 1.0}
+    settings_description['ScalingDict'] = 'Scaling parameters for UVLM state space on inputs'
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description, settings_options)
 
@@ -300,24 +304,6 @@ class LinearRFA(BaseSolver):
                             R_ls[(2*i_k+1)*n_q:(2*i_k+2)*n_q, i_p*n_q:(i_p+1)*n_q] -= np.eye(n_q)*-k/(pole_d**2 + k**2)*self.settings['imag_weight']
                     else:
                         raise NotImplementedError
-                    
-            # try:
-            #     xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
-            #     for i_p in range(n_p):
-            #         Aq_RFA.append(xq_ls[i_p*n_q:(i_p+1)*n_q, :])
-
-            #     if self.settings['pole_duplicate']:
-            #         for i_p, pole in enumerate(poles):
-            #             poles.append(pole + self.settings['pole_inf_offset'])
-            #             Aq_RFA.append(-Aq_RFA[i_p+2])
-
-            #     Qq_RFA, errq = sample_rfa(poles, Aq_RFA)
-               
-            # # Return a large error if the least squares does not converge
-            # except:
-            #     Qq_RFA = None
-            #     errq = 1e32
-            #     cout.cout_wrap('Combination did not converge', 2)
 
             xq_ls = np.linalg.lstsq(R_ls, Lq_ls)[0]
             for i_p in range(n_p):
@@ -434,7 +420,7 @@ class LinearRFA(BaseSolver):
                 poles = poles_disc_min
                 [Qq_RFA, Aq_RFA, err_q, R_ls, poles] = least_squares_q(poles)
 
-        # Save to RFA object
+        # Save to RFA object (with scaling)
         rfa_out.poles = poles
         rfa_out.k = k_vals
         rfa_out.matrices_q = Aq_RFA

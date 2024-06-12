@@ -170,7 +170,6 @@ class LinDynamicSim(BaseSolver):
             cout.cout_wrap('Number of timesteps: %g' % n_steps, 3)
             cout.cout_wrap('Number of UVLM inputs: %g' % self.data.linear.linear_system.uvlm.ss.inputs, 3)
             cout.cout_wrap('Number of beam inputs: %g' % self.data.linear.linear_system.beam.ss.inputs, 3)
-            breakpoint()
 
         try:
             dt = ss.dt

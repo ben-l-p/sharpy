@@ -212,7 +212,7 @@ class LinearAeroelastic(ss_interface.BaseElement):
             uvlm.connect_output(gain_ksa)
             uvlm.connect_input(gain_kas)
 
-            # Stiffenning and damping terms within the uvlm
+            # Stiffening and damping terms within the uvlm
             Dmod = np.zeros_like(uvlm.ss.D)
             Dmod[:flex_nodes, :flex_nodes] -= self.Kss
             if rigid_dof > 0:

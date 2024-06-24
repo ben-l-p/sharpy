@@ -420,24 +420,26 @@ def mode_sign_convention(bocos, eigenvectors, rigid_body_motion=False, use_euler
         mz_coord = 6 * (first_free_end_node - 1) + 5
         mx_coord = 6 * (first_free_end_node - 1) + 3
 
-    for i in range(0, eigenvectors.shape[1]):
-        if np.abs(eigenvectors[z_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[z_coord, i]) * eigenvectors[:, i]
+    evect_sign = np.zeros(eigenvectors.shape[1])
 
+    for i in range(eigenvectors.shape[1]):
+        if np.abs(eigenvectors[z_coord, i]) > 1e-8:
+            evect_sign[i] = np.sign(eigenvectors[z_coord, i])
+            
         elif np.abs(eigenvectors[y_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[y_coord, i]) * eigenvectors[:, i]
+            evect_sign[i] = np.sign(eigenvectors[y_coord, i])
 
         elif np.abs(eigenvectors[x_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[x_coord, i]) * eigenvectors[:, i]
+            evect_sign[i] = np.sign(eigenvectors[x_coord, i])
 
         elif np.abs(eigenvectors[my_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[my_coord, i]) * eigenvectors[:, i]
+            evect_sign[i] = np.sign(eigenvectors[my_coord, i])
 
         elif np.abs(eigenvectors[mx_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[mx_coord, i]) * eigenvectors[:, i]
+            evect_sign[i] = np.sign(eigenvectors[mx_coord, i])
 
         elif np.abs(eigenvectors[mz_coord, i]) > 1e-8:
-            eigenvectors[:, i] = np.sign(eigenvectors[mz_coord, i]) * eigenvectors[:, i]
+            evect_sign[i] = np.sign(eigenvectors[mz_coord, i])
 
         else:
             if rigid_body_motion:
@@ -449,6 +451,8 @@ def mode_sign_convention(bocos, eigenvectors, rigid_body_motion=False, use_euler
                 # this will be the case for symmetric clamped structures, where modes will be present for the left and
                 # right wings. Method should be called again when symmetric modes are removed.
                 pass
+
+        eigenvectors[:, i] = evect_sign[i] * eigenvectors[:, i]
 
     return eigenvectors
 

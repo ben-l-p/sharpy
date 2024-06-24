@@ -63,22 +63,6 @@ class IntrinsicSolver(BaseSolver):
     settings_default['dynamic_tstep_init'] = -1
     settings_description['dynamic_tstep_init'] = 'Time step of structure for calculating q0 - doesnt work yet'
 
-    settings_types['stability_analysis'] = 'bool'
-    settings_default['stability_analysis'] = False
-    settings_description['stability_analysis'] = "Sweep through velocitities to determine if solution is stable"
-
-    settings_types['stability_v_min'] = 'float'
-    settings_default['stability_v_min'] = None
-    settings_description['stability_v_min'] = 'Minimum velocity for stability analysis'
-
-    settings_types['stability_v_max'] = 'float'
-    settings_default['stability_v_max'] = None
-    settings_description['stability_v_max'] = 'Maximum velocity for stability analysis'
-
-    settings_types['stability_v_num'] = 'int'
-    settings_default['stability_v_num'] = None
-    settings_description['stability_v_num'] = 'Number of velocities for stability analysis'
-
     settings_types['d2c_method'] = 'str'
     settings_default['d2c_method'] = 'foh'
     settings_description ['d2c_method'] = 'Method for converting state space from discrete to continuous time'
@@ -172,13 +156,13 @@ class IntrinsicSolver(BaseSolver):
     settings_default['c_ref'] = None
     settings_description['c_ref'] = 'Reference chord (m)'
 
-    # settings_types['reduced_time_ss'] = 'bool'
-    # settings_default['reduced_time_ss'] = True
-    # settings_description['reduced_time_ss'] = "True for state space system in terms of reduced time, false for in terms of real time"
-
     settings_types['gravity_on'] = 'bool'
     settings_default['gravity_on'] = True
     settings_description['gravity_on'] = 'Enable gravity'
+
+    settings_types['nonlinear_structure'] = 'int'
+    settings_default['nonlinear_structure'] = 1
+    settings_description['nonlinear_structure'] = 'Include nonlinear structural couplings (Gamma terms)'
 
     settings_types['aero_on'] = 'bool'
     settings_default['aero_on'] = True
@@ -188,34 +172,29 @@ class IntrinsicSolver(BaseSolver):
     settings_default['gust_on'] = False
     settings_description['gust_on'] = 'Enable gusts'
 
+    settings_types['q0_treatment'] = 'int'
+    settings_default['q0_treatment'] = 2
+    settings_description['q0_treatment'] = 'Method for obtaining q0'
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
 
     def __init__(self):
-        self.data = None
-        self.settings = None
+        self.data = typing.Optional[sharpy.presharpy.presharpy.PreSharpy]
+        self.settings: typing.Optional[dict] = None
 
     def initialise(self, data: sharpy.presharpy.presharpy.PreSharpy, custom_settings=None, restart=False):
         # Load solver settings
         self.data = data
         if custom_settings is None:
+            typing.cast
             self.settings = data.settings[self.solver_id]
         else:
             self.settings = custom_settings
         settings_utils.to_custom_types(self.settings, self.settings_types, self.settings_default)	
 
     class Intrinsic_Obj:
-        def __init__(self):
-            self.Cab = None
-            self.X1 = None
-            self.X2 = None
-            self.X3 = None
-            self.q = None
-            self.ra = None
-            self.t = None
-            self.stability_analysis = None
-
-        def update_sol(self, sol):
+        def __init__(self, sol):
             self.Cab = np.array(sol.dynamicsystem_s1.Cab)
             self.X1 = np.array(sol.dynamicsystem_s1.X1)
             self.X2 = np.array(sol.dynamicsystem_s1.X2)
@@ -225,30 +204,8 @@ class IntrinsicSolver(BaseSolver):
             self.t = np.array(sol.dynamicsystem_s1.t)
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
-        intrinsic_out = self.Intrinsic_Obj()
+
         self.get_grid()
-
-        # Stability analysis
-        if self.settings['stability_analysis']:
-            cout.cout_wrap("Running stability analysis", 0)
-            stab_out = []
-            vels = np.linspace(self.settings['stability_v_min'],
-                               self.settings['stability_v_max'], 
-                               self.settings['stability_v_num'])
-            for vel in vels:
-                input = self.generate_settings_file(float(vel))
-                config = Config(input)
-                cout.cout_wrap(f"\nVelocity: {vel:.2f} m/s", 1)
-                cout.cout_wrap("Running Intrinsic Solver", 0)
-                sol = fem4inas_main.main(input_obj=config)
-                cout.cout_wrap("Intrinsic Solution Complete", 0)
-
-                if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)) or jnp.any(jnp.isinf(sol.dynamicsystem_s1.q)):
-                    stab_out.append({'u_inf': vel, 'is_stable': False})
-                    cout.cout_wrap("    Stable: False", 1)
-                else:
-                    stab_out.append({'u_inf': vel, 'is_stable': True})
-                    cout.cout_wrap("    Stable: True", 1)
 
         # Case to save
         input = self.generate_settings_file(self.settings['u_inf'])
@@ -258,11 +215,10 @@ class IntrinsicSolver(BaseSolver):
         cout.cout_wrap("Intrinsic Solution Complete", 0)
 
         if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)) or jnp.any(jnp.isinf(sol.dynamicsystem_s1.q)):
-            cout.cout_wrap("    Warning - model is unstable", 1)
+            cout.cout_wrap("\tWarning - model is unstable", 1)
 
-        intrinsic_out.update_sol(sol)
+        intrinsic_out = self.Intrinsic_Obj(sol)
         self.data.intrinsic = intrinsic_out
-
 
         return self.data
 
@@ -283,7 +239,7 @@ class IntrinsicSolver(BaseSolver):
         self.beam_number = self.data.structure.beam_number
 
         self.node_numbers = range(-1, self.data.structure.num_node-1)         #TODO - make this use SHARPy node numbers
-        self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for j in (0, 1)]
+        self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for _ in (0, 1)]
 
     # Return collocation points at the leading edge of all surfaces
     def calculate_collocation_dihedral(self):
@@ -299,7 +255,7 @@ class IntrinsicSolver(BaseSolver):
 
         return np.array(col), np.array(dih)
 
-    def generate_settings_file(self, u_inf) -> Inputs:
+    def generate_settings_file(self, u_inf: float) -> Inputs:
         inp = Inputs()
 
         # General settings
@@ -309,6 +265,8 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
         inp.systems.sett.s1.xloads.modalaero_forces = self.settings['aero_on']
         inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
+        inp.systems.sett.s1.nonlinear = self.settings['nonlinear_structure']
+        inp.systems.sett.s1.q0treatment = self.settings['q0_treatment']
         inp.systems.sett.s1.bc1 = 'clamped'
         inp.engine = self.settings['engine']
         inp.driver.typeof = self.settings['driver']
@@ -342,6 +300,19 @@ class IntrinsicSolver(BaseSolver):
         inp.fem.fe_order = self.node_numbers
         inp.fem.grid = None
         inp.fem.eig_names = None
+
+        evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
+        evals = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvalues']
+        
+        evecs @= np.diag(
+            (1.0, -1.0, -1.0, 1.0, 1.0,
+             -1.0, -1.0, -1.0, -1.0, -1.0,
+             1.0, -1.0, 1.0, -1.0, -1.0))
+
+        # evecs @= np.diag((-1, 1, 1, 0, -1, 1, 1, -1, -1, -1, -1, -1, 0, -1, 1))   # For uncorrected modal sign
+        
+        inp.fem.eigenvals = evals
+        inp.fem.eigenvecs = evecs
 
         # Roger aero inputs
         if self.settings['aero_approx'] == 'roger' and self.settings['aero_on']:
@@ -397,8 +368,6 @@ class IntrinsicSolver(BaseSolver):
         # Statespace aero inputs
         # The state space system is given in dimensional time
         elif self.settings['aero_approx'] == 'statespace' and self.settings['aero_on']:
-            scaling_dict = self.data.settings['LinearAssembler']['linear_system_settings']['aero_settings']['ScalingDict']
-
             # Remove structural states
             states_keep = []
             for i_s in range(self.data.linear.ss.state_variables.num_variables):
@@ -423,6 +392,9 @@ class IntrinsicSolver(BaseSolver):
 
             # Split into three state space systems for each input
             # The A and C matrices are constant between the three
+
+            B0, B1, Bw, D0, D1, Dw = None, None, None, None, None, None
+
             for i_s in range(self.data.linear.ss.input_variables.num_variables):
                 var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
                 param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
@@ -436,6 +408,9 @@ class IntrinsicSolver(BaseSolver):
                     case 'u_gust':
                         Bw = ss_c.B[:, param_index]
                         Dw = ss_c.D[:, param_index]
+
+            assert not (B0 is None or B1 is None or D0 is None or D1 is None), \
+                    "Missing partition of state space inputs"
             
             inp.systems.sett.s1.aero.approx = 'statespace'
             inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A, dtype=float)
@@ -447,6 +422,9 @@ class IntrinsicSolver(BaseSolver):
 
             # Aero due to disturbances
             if self.settings['gust_on']:
+
+                assert not (Bw is None or Dw is None), \
+                 "Missing partition of state space inputs"
 
                 # Find index of leading edge elements in state space gust vector
                 leading_edge_index = []
@@ -466,8 +444,8 @@ class IntrinsicSolver(BaseSolver):
                 col_le = col[leading_edge_index, :]
                 dih_le = dih[leading_edge_index]
 
-                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw_le)
-                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw_le)
+                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw_le, dtype=float)
+                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw_le, dtype=float)
                 inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih_le)
                 inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col_le)
 
@@ -481,10 +459,7 @@ class IntrinsicSolver(BaseSolver):
         if self.settings['tn'] > 0:     # Set number of steps from input
             tn = self.settings['tn']
         else:                           # Set number of steps from eigenvalues
-            (evals, _) = np.linalg.eig(K @ np.linalg.inv(M))
-            evals.sort()
-
-            if self.settings['aero_approx'] == 'roger':
+            if self.settings['aero_approx'] == 'roger' or not self.settings['aero_on']:
                 tn = int(2*np.sqrt(evals[self.settings['num_modes']-1])*self.settings['t_factor']*self.settings['t1'])
             elif self.settings['aero_approx'] == 'statespace':
                 tn_struct = int(2*np.sqrt(evals[self.settings['num_modes']-1]))

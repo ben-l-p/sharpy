@@ -361,12 +361,12 @@ class MultiLeadingEdge(LinearGust):
 
 def get_freestream_velocity(data):
     try:
-        u_inf = data.settings['StaticUvlm']['aero_solver_settings']['u_inf']
-        u_inf_direction = data.settings['StaticCoupled']['aero_solver_settings']['u_inf_direction']
+        u_inf = data.settings['StaticUvlm']['velocity_field_input']['u_inf']
+        u_inf_direction = data.settings['StaticUvlm']['velocity_field_input']['u_inf_direction']
     except KeyError:
         try:
-            u_inf = data.settings['StaticCoupled']['aero_solver_settings']['velocity_field_input']['u_inf']
-            u_inf_direction = data.settings['StaticCoupled']['aero_solver_settings']['velocity_field_input']['u_inf_direction']
+            u_inf = data.settings['StaticCoupled']['aero_settings']['velocity_field_input']['u_inf']
+            u_inf_direction = data.settings['StaticCoupled']['aero_settings']['velocity_field_input']['u_inf_direction']
         except KeyError:
             cout.cout_wrap('Unable to find free stream velocity settings in StaticUvlm or StaticCoupled,'
                            'please ensure these settings are provided in the config .sharpy file. If'

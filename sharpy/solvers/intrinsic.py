@@ -304,7 +304,7 @@ class IntrinsicSolver(BaseSolver):
         evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
         evals = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvalues']
         
-        evecs @= np.diag(
+        evecs @= np.diag(                       # TODO: calculate this automatically (and work out why its needed)
             (1.0, -1.0, -1.0, 1.0, 1.0,
              -1.0, -1.0, -1.0, -1.0, -1.0,
              1.0, -1.0, 1.0, -1.0, -1.0))

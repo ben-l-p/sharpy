@@ -251,7 +251,7 @@ class IntrinsicSolver(BaseSolver):
             for i_N in range(surf.shape[2]):
                 for i_M in range(surf.shape[1]):
                     col.append([surf[0, i_M, i_N], surf[1, i_M, i_N], surf[2, i_M, i_N]])
-                    dih.append([1.0,])      # TODO: optimise this code and add dihedral
+                    dih.append([1.0,])      # TODO: optimise this code and add dihedral (this is already rotated in linear UVLM!)
 
         return np.array(col), np.array(dih)
 
@@ -301,18 +301,19 @@ class IntrinsicSolver(BaseSolver):
         inp.fem.grid = None
         inp.fem.eig_names = None
 
-        evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
-        evals = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvalues']
-        
-        evecs @= np.diag(                       # TODO: calculate this automatically (and work out why its needed)
-            (1.0, -1.0, -1.0, 1.0, 1.0,
-             -1.0, -1.0, -1.0, -1.0, -1.0,
-             1.0, -1.0, 1.0, -1.0, -1.0))
+        invMK = np.linalg.solve(M, K)
+        evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
 
-        # evecs @= np.diag((-1, 1, 1, 0, -1, 1, 1, -1, -1, -1, -1, -1, 0, -1, 1))   # For uncorrected modal sign
-        
+        M_diag = evecs.T @ M @ evecs                    
+        evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
+
+        order_i = np.argsort(evals)                         # Order for increasing eigenvalues
+        evals = evals[order_i]
+        evecs = evecs[:, order_i]
+
         inp.fem.eigenvals = evals
-        inp.fem.eigenvecs = evecs
+        inp.fem.eigenvecs = -evecs      # Negative is used to make modal coordinates consistent with linear model but not necessary
+        inp.fem.eig_type = "inputs"
 
         # Roger aero inputs
         if self.settings['aero_approx'] == 'roger' and self.settings['aero_on']:
@@ -426,28 +427,12 @@ class IntrinsicSolver(BaseSolver):
                 assert not (Bw is None or Dw is None), \
                  "Missing partition of state space inputs"
 
-                # Find index of leading edge elements in state space gust vector
-                leading_edge_index = []
-                prev_end = 0
-                for surf_dim in self.data.aero.timestep_info[self.settings['use_custom_timestep']].dimensions:
-                    leading_edge_index.extend((np.arange(surf_dim[1]+1)*(surf_dim[0]+1))+prev_end)
-                    prev_end += (surf_dim[0]+1)*(surf_dim[1]+1)
-
-                # Create gust matrices for leading edge panels only
-                n_w = len(leading_edge_index)
-
-                Bw_le = Bw[:, [3*i for i in leading_edge_index]]
-                Dw_le = Dw[:, [3*i for i in leading_edge_index]]
-
-                # Collocation point coordinates and dihedral for leading edge panels
                 col, dih = self.calculate_collocation_dihedral()
-                col_le = col[leading_edge_index, :]
-                dih_le = dih[leading_edge_index]
 
-                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw_le, dtype=float)
-                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw_le, dtype=float)
-                inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih_le)
-                inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col_le)
+                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw[:, 2::3], dtype=float)
+                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw[:, 2::3], dtype=float)
+                inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
+                inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
 
                 inp.systems.sett.s1.aero.gust_profile = "mc"
                 inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']

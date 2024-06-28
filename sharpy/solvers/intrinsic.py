@@ -129,13 +129,18 @@ class IntrinsicSolver(BaseSolver):
     settings_default['t1'] = None
     settings_description['t1'] = 'Simulation time (s)'
 
-    settings_types['tn'] = 'int'
-    settings_default['tn'] = 10000
-    settings_description['tn'] = 'Number of simulation steps'
+    settings_types['dt'] = 'float'
+    settings_default['dt'] = 0.001
+    settings_description['dt'] = 'Number of simulation steps'
 
-    settings_types['t_factor'] = 'float'
-    settings_default['t_factor'] = -1.0
-    settings_description['t_factor'] = 'Multiple of Nyquist step size for highest frequency mode to use. Set to -1 to be disabled and set number of steps using tn'
+    settings_types['dt_method'] = 'str'
+    settings_default['dt_method'] = 'grid'
+    settings_description['dt_method'] = 'Method used to determine the time step size'
+    settings_options['dt_method'] = ['grid', 'input', 'eigenvalues']
+
+    settings_types['dt_factor'] = 'float'
+    settings_default['dt_factor'] = 1.0
+    settings_description['tdt_factor'] = 'Multiple applied to number of time steps.'
 
     settings_types['rho'] = 'float'
     settings_default['rho'] = None
@@ -459,22 +464,23 @@ class IntrinsicSolver(BaseSolver):
         Determine number of time steps for simulation
         """
 
-        if self.settings['tn'] > 0:     # Set number of steps from input
-            tn = self.settings['tn']
-        else:                           # Set number of steps from eigenvalues
-            if self.settings['aero_approx'] == 'roger' or not self.settings['aero_on']:
-                tn = int(2*np.sqrt(self.evals[self.settings['num_modes']-1])*\
-                         self.settings['t_factor']*self.settings['t1'])
-            elif self.settings['aero_approx'] == 'statespace':
-                tn_struct = int(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
-                tn_aero = int(np.max(np.linalg.eig(self.ss_c.A)[0].imag))               # For dimensional aero
-                
-                cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
-                cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
-                tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
-            else:
-                raise AttributeError
+        match self.settings['dt_method']:
+            case 'grid':
+                dt = self.data.linear.ss.dt     # For dimensional aero
+            case 'input':
+                dt = self.settings['dt']
+            case 'eivenvalues':
+                if self.settings['aero_approx'] == 'roger' or not self.settings['aero_on']:
+                    dt = 1/(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
+                elif self.settings['aero_approx'] == 'statespace':
+                    dt_struct = 1/(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
+                    dt_aero = 1/(2*np.max(np.linalg.eig(self.ss_c.A)[0].imag))               # For dimensional aero
+                    
+                    cout.cout_wrap(f"Required structure time stepsize: {dt_struct:4f}", 1)
+                    cout.cout_wrap(f"Required aero time steps per second: {dt_aero:4f}", 1)
+                    dt = min(dt_struct, dt_aero)
 
+        tn = int(self.settings['t1']/(dt * self.settings['dt_factor']))
         inp.systems.sett.s1.tn = tn
         cout.cout_wrap(f"Number of time steps: {tn}", 0)
 
@@ -519,18 +525,22 @@ class IntrinsicSolver(BaseSolver):
 
         self.M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
         self.K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
-
-        invMK = np.linalg.solve(self.M, self.K)
-        evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
-
-        M_diag = evecs.T @ self.M @ evecs                    
-        evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
-
-        order_i = np.argsort(evals)                         # Order for increasing eigenvalues
-
-        self.evecs_full = evecs[:, order_i]
-        self.evals_full = evals[order_i]
         self.num_modes = self.settings['num_modes']
 
-        self.evals = self.evals_full[:self.num_modes]
-        self.evecs = self.evecs_full[:, :self.num_modes]
+        # invMK = np.linalg.solve(self.M, self.K)
+        # evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
+
+        # M_diag = evecs.T @ self.M @ evecs                    
+        # evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
+
+        # order_i = np.argsort(evals)                         # Order for increasing eigenvalues
+
+        # self.evecs_full = evecs[:, order_i]
+        # self.evals_full = evals[order_i]
+
+
+        # self.evals = self.evals_full[:self.num_modes]
+        # self.evecs = self.evecs_full[:, :self.num_modes]
+
+        self.evals = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvalues']
+        self.evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']

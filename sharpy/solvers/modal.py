@@ -95,6 +95,10 @@ class Modal(BaseSolver):
     settings_default['rigid_modes_cg'] = False
     settings_description['rigid_modes_cg'] = 'Not implemente yet'
 
+    settings_types['mode_sign_convention'] = 'bool'
+    settings_default['mode_sign_convention'] = True
+    settings_description['mode_sign_convention'] = 'Use consistent mode directions'
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
 
@@ -351,8 +355,9 @@ class Modal(BaseSolver):
             eigenvectors_left = eigenvectors_left[:, order].conj()
 
         # Modify rigid body modes for them to be defined wrt the CG
-        eigenvectors = modalutils.mode_sign_convention(self.data.structure.boundary_conditions, eigenvectors,
-                                                       self.rigid_body_motion)
+        if self.settings['mode_sign_convention']:
+            eigenvectors = modalutils.mode_sign_convention(self.data.structure.boundary_conditions, eigenvectors,
+                                                        self.rigid_body_motion)
         if not eigenvectors_left:
             if self.settings['rigid_modes_ppal_axes']:
                 eigenvectors, t_pa, r_pa = modalutils.free_modes_principal_axes(eigenvectors, FullMglobal,

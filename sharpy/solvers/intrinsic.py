@@ -9,6 +9,7 @@ from sharpy.utils.solver_interface import solver, BaseSolver
 import sharpy.utils.settings as settings_utils
 import sharpy.utils.cout_utils as cout
 import sharpy.presharpy.presharpy
+import sharpy.utils.algebra as algebra
 
 # FEM4INAS
 from fem4inas import fem4inas_main
@@ -47,10 +48,6 @@ class IntrinsicSolver(BaseSolver):
     settings_default['delta_curved'] = 1e-2
     settings_description['delta_curved'] = 'Threshold for linear rotations'
 
-    settings_types['plot_eigenvalues'] = 'bool'
-    settings_default['plot_eigenvalues'] = False
-    settings_description['plot_eigenvalues'] = 'Plot to screen root locus diagram'
-
     settings_types['use_custom_timestep'] = 'int'
     settings_default['use_custom_timestep'] = 0
     settings_description['use_custom_timestep'] = 'Time step of structure for calculating modes'
@@ -58,10 +55,6 @@ class IntrinsicSolver(BaseSolver):
     settings_types['component_names'] = 'list(str)'
     settings_default['component_names'] = []
     settings_description['component_names'] = 'Name components of the structure. Will use lettering [A, B, ...] by default'
-
-    settings_types['dynamic_tstep_init'] = 'int'
-    settings_default['dynamic_tstep_init'] = -1
-    settings_description['dynamic_tstep_init'] = 'Time step of structure for calculating q0 - doesnt work yet'
 
     settings_types['d2c_method'] = 'str'
     settings_default['d2c_method'] = 'foh'
@@ -162,7 +155,7 @@ class IntrinsicSolver(BaseSolver):
 
     settings_types['nonlinear_structure'] = 'int'
     settings_default['nonlinear_structure'] = 1
-    settings_description['nonlinear_structure'] = 'Include nonlinear structural couplings (Gamma terms)'
+    settings_description['nonlinear_structure'] = 'Include nonlinear structural couplings (gamma terms)'
 
     settings_types['aero_on'] = 'bool'
     settings_default['aero_on'] = True
@@ -204,12 +197,14 @@ class IntrinsicSolver(BaseSolver):
             self.t = np.array(sol.dynamicsystem_s1.t)
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
-
         self.get_grid()
+        self.calculate_eigs()
+        self.jig_loads()
 
         # Case to save
         input = self.generate_settings_file(self.settings['u_inf'])
         config = Config(input)
+
         cout.cout_wrap("\nRunning Intrinsic Solver", 0)
         sol = fem4inas_main.main(input_obj=config)
         cout.cout_wrap("Intrinsic Solution Complete", 0)
@@ -256,6 +251,10 @@ class IntrinsicSolver(BaseSolver):
         return np.array(col), np.array(dih)
 
     def generate_settings_file(self, u_inf: float) -> Inputs:
+        """
+        Generate case file which is passed to FENIAX
+        """
+
         inp = Inputs()
 
         # General settings
@@ -286,13 +285,10 @@ class IntrinsicSolver(BaseSolver):
         # FEM Inputs
         inp.fem.connectivity = dict(A=None)             #TODO: replace with connectivity
 
-        M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
-        K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
-
-        inp.fem.Ka = jnp.array(K)
-        inp.fem.Ma = jnp.array(M)
+        inp.fem.Ka = jnp.array(self.K)
+        inp.fem.Ma = jnp.array(self.M)
         
-        inp.fem.num_modes = self.settings['num_modes']
+        inp.fem.num_modes = self.num_modes
 
         # inp.fem.eig_type = "inputs"
         inp.fem.X = jnp.array(self.X)
@@ -301,154 +297,178 @@ class IntrinsicSolver(BaseSolver):
         inp.fem.grid = None
         inp.fem.eig_names = None
 
-        invMK = np.linalg.solve(M, K)
-        evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
-
-        M_diag = evecs.T @ M @ evecs                    
-        evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
-
-        order_i = np.argsort(evals)                         # Order for increasing eigenvalues
-        evals = evals[order_i]
-        evecs = evecs[:, order_i]
-
-        inp.fem.eigenvals = evals
-        inp.fem.eigenvecs = -evecs      # Negative is used to make modal coordinates consistent with linear model but not necessary
+        inp.fem.eigenvals = self.evals
+        inp.fem.eigenvecs = self.evecs      
         inp.fem.eig_type = "inputs"
 
-        # Roger aero inputs
-        if self.settings['aero_approx'] == 'roger' and self.settings['aero_on']:
-            if not hasattr(self.data.linear, 'rfa'):
-                raise AttributeError("RFA postproccesor needs to be run")
-            
-            # Aero due to structure
-            A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], self.settings['num_modes']], dtype=float)
-            A[0, :, :] = self.data.linear.rfa.matrices_q[0]
-            A[1, :, :] = self.data.linear.rfa.matrices_q[1]
-            for i_mat in range(len(self.data.linear.rfa.poles)):
-                A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
+        if self.settings['aero_on']:
+            if self.settings['aero_approx'] == 'roger':
+                self.roger_structure(inp)
+                if self.settings['gust_on']:
+                    self.roger_gust(inp)
+            elif self.settings['aero_approx'] == 'statespace':
+                self.statespace_structure(inp)
+                if self.settings['gust_on']:
+                    self.statespace_gust(inp)
 
-            inp.systems.sett.s1.aero.poles = -jnp.array(self.data.linear.rfa.poles)
-            inp.systems.sett.s1.aero.A = jnp.array(A)
+        self.calculate_n_tstep(inp)
+        return inp
 
-            # Aero due to disturbances
-            if self.settings['gust_on']:
+    def roger_structure(self, inp: Inputs) -> None:
+        """
+        Generate settings for Roger structural aero
+        """
 
-                # Check RFA exists
-                if self.data.linear.rfa.matrices_w is None:
-                    raise AttributeError("Gust matrices need to be generated by RFA postprocessor")
+        if not hasattr(self.data.linear, 'rfa'):
+            raise AttributeError("RFA postproccesor needs to be run")
+        
+        # Aero due to structure
+        A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], 
+                    self.settings['num_modes']], dtype=float)
+        A[0, :, :] = self.data.linear.rfa.matrices_q[0]
+        A[1, :, :] = self.data.linear.rfa.matrices_q[1]
+        for i_mat in range(len(self.data.linear.rfa.poles)):
+            A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
 
-                # Find index of leading edge elements in state space gust vector
-                leading_edge_index = []
-                prev_end = 0
-                for surf_dim in self.data.aero.timestep_info[self.settings['use_custom_timestep']].dimensions:
-                    leading_edge_index.extend((np.arange(surf_dim[1]+1)*(surf_dim[0]+1))+prev_end)
-                    prev_end += (surf_dim[0]+1)*(surf_dim[1]+1)
+        inp.systems.sett.s1.aero.poles = -jnp.array(self.data.linear.rfa.poles)
+        inp.systems.sett.s1.aero.A = jnp.array(A)
 
-                # Create gust matrices for leading edge panels only
-                n_w = len(leading_edge_index)
-                D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
-                D[0, :, :] = self.data.linear.rfa.matrices_w[0][:, [3*i for i in leading_edge_index]]
-                for i_mat in range(len(self.data.linear.rfa.poles)):
-                    D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1][:, [3*i for i in leading_edge_index]]
+    def roger_gust(self, inp: Inputs) -> None:
+        """
+        Generate settings for Roger gust
+        """
+                
+        # Check RFA exists
+        if self.data.linear.rfa.matrices_w is None:
+            raise AttributeError("Gust matrices need to be generated by RFA postprocessor")
 
-                # Collocation point coordinates and dihedral for leading edge panels
-                col, dih = self.calculate_collocation_dihedral()
-                col_le = col[leading_edge_index, :]
-                dih_le = dih[leading_edge_index]
+        # Find index of leading edge elements in state space gust vector
+        leading_edge_index = []
+        prev_end = 0
+        for surf_dim in self.data.aero.timestep_info[self.settings['use_custom_timestep']].dimensions:
+            leading_edge_index.extend((np.arange(surf_dim[1]+1)*(surf_dim[0]+1))+prev_end)
+            prev_end += (surf_dim[0]+1)*(surf_dim[1]+1)
 
-                inp.systems.sett.s1.aero.D = jnp.array(D)
-                inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih_le)
-                inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col_le)
+        # Create gust matrices for leading edge panels only
+        n_w = len(leading_edge_index)
+        D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
+        D[0, :, :] = self.data.linear.rfa.matrices_w[0][:, [3*i for i in leading_edge_index]]
+        for i_mat in range(len(self.data.linear.rfa.poles)):
+            D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1][:, [3*i for i in leading_edge_index]]   
 
-                inp.systems.sett.s1.aero.gust_profile = "mc"
-                inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
-                inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
-                inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
-                inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
+        # Collocation point coordinates and dihedral for leading edge panels
+        col, dih = self.calculate_collocation_dihedral()
+        col_le = col[leading_edge_index, :]
+        dih_le = dih[leading_edge_index]
 
-        # Statespace aero inputs
-        # The state space system is given in dimensional time
-        elif self.settings['aero_approx'] == 'statespace' and self.settings['aero_on']:
-            # Remove structural states
-            states_keep = []
-            for i_s in range(self.data.linear.ss.state_variables.num_variables):
-                if self.data.linear.ss.state_variables.vector_variables[i_s].name not in ['q', 'q_dot']:
-                    states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
-            
-            # Remove non-forcing outputs
-            outputs_keep = []
-            for i_s in range(self.data.linear.ss.output_variables.num_variables):
-                if self.data.linear.ss.output_variables.vector_variables[i_s].name == 'Q':
-                    outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
+        inp.systems.sett.s1.aero.D = jnp.array(D)
+        inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih_le)
+        inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col_le)
 
-            # Truncate states and outputs
-            ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(states_keep, states_keep)], \
-                                    self.data.linear.ss.B[states_keep, :], \
-                                    self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)], \
-                                    self.data.linear.ss.D[outputs_keep, :], \
-                                    self.data.linear.ss.dt)
-            
-            # Convert to continuous time state space model
-            ss_c = ss_d_trunc.d2c(self.settings['d2c_method'])
+        inp.systems.sett.s1.aero.gust_profile = "mc"
+        inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
+        inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
+        inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
+        inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
 
-            # Split into three state space systems for each input
-            # The A and C matrices are constant between the three
+    def statespace_structure(self, inp: Inputs) -> None:
+        """
+        Convert statespace system from discrete to continuous time and partition by input
+        """
 
-            B0, B1, Bw, D0, D1, Dw = None, None, None, None, None, None
+        # Remove structural states
+        states_keep = []
+        for i_s in range(self.data.linear.ss.state_variables.num_variables):
+            if self.data.linear.ss.state_variables.vector_variables[i_s].name not in ['q', 'q_dot']:
+                states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
+        
+        # Remove non-forcing outputs
+        outputs_keep = []
+        for i_s in range(self.data.linear.ss.output_variables.num_variables):
+            if self.data.linear.ss.output_variables.vector_variables[i_s].name == 'Q':
+                outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
 
-            for i_s in range(self.data.linear.ss.input_variables.num_variables):
-                var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
-                param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
-                match var_name:
-                    case 'q':
-                        B0 = ss_c.B[:, param_index] 
-                        D0 = ss_c.D[:, param_index]
-                    case 'q_dot':
-                        B1 = ss_c.B[:, param_index]
-                        D1 = ss_c.D[:, param_index]
-                    case 'u_gust':
-                        Bw = ss_c.B[:, param_index]
-                        Dw = ss_c.D[:, param_index]
+        # Truncate states and outputs
+        ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(states_keep, states_keep)], \
+                                self.data.linear.ss.B[states_keep, :], \
+                                self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)], \
+                                self.data.linear.ss.D[outputs_keep, :], \
+                                self.data.linear.ss.dt)
+        
+        # Convert to continuous time state space model
+        self.ss_c = ss_d_trunc.d2c(self.settings['d2c_method'])
 
-            assert not (B0 is None or B1 is None or D0 is None or D1 is None), \
-                    "Missing partition of state space inputs"
-            
-            inp.systems.sett.s1.aero.approx = 'statespace'
-            inp.systems.sett.s1.aero.ss_A = jnp.array(ss_c.A, dtype=float)
-            inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0, dtype=float)
-            inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1, dtype=float)
-            inp.systems.sett.s1.aero.ss_C = jnp.array(ss_c.C, dtype=float)
-            inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0, dtype=float)
-            inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1, dtype=float)
+        # Split into three state space systems for each input
+        # The A and C matrices are constant between the three
 
-            # Aero due to disturbances
-            if self.settings['gust_on']:
+        B0 = None
+        B1 = None
+        D0 = None
+        D1 = None
+        self.Bw = None
+        self.Dw = None
 
-                assert not (Bw is None or Dw is None), \
-                 "Missing partition of state space inputs"
+        for i_s in range(self.data.linear.ss.input_variables.num_variables):
+            var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
+            param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
+            match var_name:
+                case 'q':
+                    B0 = self.ss_c.B[:, param_index] 
+                    D0 = self.ss_c.D[:, param_index]
+                case 'q_dot':
+                    B1 = self.ss_c.B[:, param_index]
+                    D1 = self.ss_c.D[:, param_index]
+                case 'u_gust':
+                    self.Bw = self.ss_c.B[:, param_index]
+                    self.Dw = self.ss_c.D[:, param_index]
 
-                col, dih = self.calculate_collocation_dihedral()
+        assert not (B0 is None or B1 is None or D0 is None or D1 is None), \
+                "Missing partition of state space inputs"
+        
+        inp.systems.sett.s1.aero.approx = 'statespace'
+        inp.systems.sett.s1.aero.ss_A = jnp.array(self.ss_c.A, dtype=float)
+        inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0, dtype=float)
+        inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1, dtype=float)
+        inp.systems.sett.s1.aero.ss_C = jnp.array(self.ss_c.C, dtype=float)
+        inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0, dtype=float)
+        inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1, dtype=float)
 
-                inp.systems.sett.s1.aero.ss_Bw = jnp.array(Bw[:, 2::3], dtype=float)
-                inp.systems.sett.s1.aero.ss_Dw = jnp.array(Dw[:, 2::3], dtype=float)
-                inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
-                inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
+    def statespace_gust(self, inp: Inputs) -> None:
+        """
+        Generate settings for statespace gust
+        """
 
-                inp.systems.sett.s1.aero.gust_profile = "mc"
-                inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
-                inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
-                inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
-                inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
+        assert not (self.Bw is None or self.Dw is None), \
+            "Missing partition of state space inputs"
 
-        # Determine number of time steps
+        col, dih = self.calculate_collocation_dihedral()
+
+        inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.Bw[:, 2::3], dtype=float)
+        inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.Dw[:, 2::3], dtype=float)
+        inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
+        inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
+
+        inp.systems.sett.s1.aero.gust_profile = "mc"
+        inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
+        inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
+        inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
+        inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
+
+    def calculate_n_tstep(self, inp: Inputs) -> None:
+        """
+        Determine number of time steps for simulation
+        """
+
         if self.settings['tn'] > 0:     # Set number of steps from input
             tn = self.settings['tn']
         else:                           # Set number of steps from eigenvalues
             if self.settings['aero_approx'] == 'roger' or not self.settings['aero_on']:
-                tn = int(2*np.sqrt(evals[self.settings['num_modes']-1])*self.settings['t_factor']*self.settings['t1'])
+                tn = int(2*np.sqrt(self.evals[self.settings['num_modes']-1])*\
+                         self.settings['t_factor']*self.settings['t1'])
             elif self.settings['aero_approx'] == 'statespace':
-                tn_struct = int(2*np.sqrt(evals[self.settings['num_modes']-1]))
-                tn_aero = int(np.max(np.linalg.eig(ss_c.A)[0].imag)*(2*u_inf)/self.settings['c_ref'])
+                tn_struct = int(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
+                tn_aero = int(np.max(np.linalg.eig(self.ss_c.A)[0].imag))               # For dimensional aero
+                
                 cout.cout_wrap(f"Required structure time steps per second: {tn_struct}", 1)
                 cout.cout_wrap(f"Required aero time steps per second: {tn_aero}", 1)
                 tn = int(max((tn_struct, tn_aero))*self.settings['t_factor']*self.settings['t1'])
@@ -458,4 +478,59 @@ class IntrinsicSolver(BaseSolver):
         inp.systems.sett.s1.tn = tn
         cout.cout_wrap(f"Number of time steps: {tn}", 0)
 
-        return inp
+    def jig_loads(self) -> None:
+        """
+        Calculate loads in the jig shape, present due to twist or AoA
+        """
+
+        fm_total = self.data.aero.timestep_info[self.settings['use_custom_timestep']].forces
+
+        for i_surf in range(len(fm_total)):         # TODO: support multiple surfaces
+            f_surf = fm_total[i_surf][:3, ...]   # 3 x M+1 x N+1
+            f_node = np.sum(f_surf, 1)
+
+            beam_pos = self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos
+            zeta = self.data.aero.timestep_info[self.settings['use_custom_timestep']].zeta
+
+            M, N = zeta[i_surf].shape[1:]
+
+            m_node = np.zeros_like(f_node)
+            for i_N in range(N):
+                for i_M in range(M):
+                    r = zeta[i_surf][:, i_M, i_N] - beam_pos[i_N, :]
+                    r_skew = algebra.skew(r)
+                    m_node[:, i_N] += r_skew @ f_surf[:, i_M, i_N]
+
+            fm_nodal = np.zeros(N*6)
+            fm_nodal[0::6] = f_node[0, :]
+            fm_nodal[1::6] = f_node[1, :]
+            fm_nodal[2::6] = f_node[2, :]
+            fm_nodal[3::6] = m_node[0, :]
+            fm_nodal[4::6] = m_node[1, :]
+            fm_nodal[5::6] = m_node[2, :]
+
+            self.fm_jig_nodal = fm_nodal
+
+    def calculate_eigs(self) -> None:
+        """
+        Structural eigendecomposition to give the square of the natural frequencies
+        and the linear normal mode shapes
+        """
+
+        self.M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
+        self.K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
+
+        invMK = np.linalg.solve(self.M, self.K)
+        evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
+
+        M_diag = evecs.T @ self.M @ evecs                    
+        evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
+
+        order_i = np.argsort(evals)                         # Order for increasing eigenvalues
+
+        self.evecs_full = evecs[:, order_i]
+        self.evals_full = evals[order_i]
+        self.num_modes = self.settings['num_modes']
+
+        self.evals = self.evals_full[:self.num_modes]
+        self.evecs = self.evecs_full[:, :self.num_modes]

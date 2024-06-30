@@ -19,7 +19,23 @@ from fem4inas.preprocessor.inputs import Inputs
 @solver
 class IntrinsicSolver(BaseSolver):
     """
-    Description of intrinsic solver...
+    Solver which calls FENIAX, which computes a time-domain solution comprised of a
+    non-linear structural model coupled with linearised aerodynamics. These can be included
+    as either a Roger's aerodynamic approximation in the frequency domain, obtained through the
+    'linearrfa' solver, or by integrating state space aerodynamics. 
+
+    The 'Modal', 'StaticUvlm' and 'LinearAssembler' solver must be run prior, as well as 'LinearRFA' 
+    if using Roger's aero. The 'StaticUVLM' solver is here used to get a developed flow in the UVLM
+    for linearising around, whilst not allowing any structural deflections. This is due to the
+    intrinsic formulation requiring an undeformed reference state. 
+
+    flow =  ['BeamLoader', 
+            'AerogridLoader',
+            'Modal',
+            'StaticUvlm',
+            'LinearAssembler',
+            'Intrinsic']
+
     """
 
     # Settings used to generate inputs for FEM4INAS
@@ -63,19 +79,19 @@ class IntrinsicSolver(BaseSolver):
 
     settings_types['gust_intensity'] = 'float'
     settings_default['gust_intensity'] = 0.0
-    settings_description['gust_intensity'] = 'yes'
+    settings_description['gust_intensity'] = 'Intensity of gust (m/s)'
 
     settings_types['gust_length'] = 'float'
     settings_default['gust_length'] = 0.0
-    settings_description['gust_length'] = 'yes'
+    settings_description['gust_length'] = 'Length of gust'
 
     settings_types['gust_num_x'] = 'int'
     settings_default['gust_num_x'] = 0
-    settings_description['gust_num_x'] = 'yes'
+    settings_description['gust_num_x'] = 'Number of spatial points for the gust to be evaluated, between which they are interpolated'
 
     settings_types['gust_offset'] = 'float'
     settings_default['gust_offset'] = 0.0
-    settings_description['gust_offset'] = 'yes'
+    settings_description['gust_offset'] = 'Offset distance of gust'
 
     settings_types['engine'] = 'str'
     settings_default['engine'] = 'intrinsicmodal'
@@ -202,20 +218,38 @@ class IntrinsicSolver(BaseSolver):
             self.t = np.array(sol.dynamicsystem_s1.t)
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
+        # Create all case inputs
         self.get_grid()
         self.calculate_eigs()
         self.jig_loads()
 
-        # Case to save
-        input = self.generate_settings_file(self.settings['u_inf'])
+        self.aero_model = self.settings['aero_approx']
+        self.gust_on = self.settings['gust_on']
+        self.aero_on = self.settings['aero_on']
+        if self.aero_on:
+            if self.aero_model == 'roger':
+                self.roger_structure()
+                if self.gust_on:
+                    self.roger_gust()
+            elif self.aero_model == 'statespace':
+                self.statespace_structure()
+
+        self.calculate_n_tstep()
+        cout.cout_wrap(f"Number of time steps: {self.tn}", 0)
+
+        self.check_stability()
+
+        # Generate case object
+        input = self.generate_settings_file()
         config = Config(input)
 
+        # Run case
         cout.cout_wrap("\nRunning Intrinsic Solver", 0)
         sol = fem4inas_main.main(input_obj=config)
         cout.cout_wrap("Intrinsic Solution Complete", 0)
 
         if jnp.any(jnp.isnan(sol.dynamicsystem_s1.q)) or jnp.any(jnp.isinf(sol.dynamicsystem_s1.q)):
-            cout.cout_wrap("\tWarning - model is unstable", 1)
+            cout.cout_wrap("\tWarning - output contains NaN or Inf values", 1)
 
         intrinsic_out = self.Intrinsic_Obj(sol)
         self.data.intrinsic = intrinsic_out
@@ -238,6 +272,7 @@ class IntrinsicSolver(BaseSolver):
         self.conn = self.data.structure.connectivities
         self.beam_number = self.data.structure.beam_number
 
+        self.num_modes = self.settings['num_modes']
         self.node_numbers = range(-1, self.data.structure.num_node-1)         #TODO - make this use SHARPy node numbers
         self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for _ in (0, 1)]
 
@@ -255,7 +290,7 @@ class IntrinsicSolver(BaseSolver):
 
         return np.array(col), np.array(dih)
 
-    def generate_settings_file(self, u_inf: float) -> Inputs:
+    def generate_settings_file(self) -> Inputs:
         """
         Generate case file which is passed to FENIAX
         """
@@ -264,10 +299,11 @@ class IntrinsicSolver(BaseSolver):
 
         # General settings
         inp.systems.sett.s1.t1 = self.settings['t1']
+        inp.systems.sett.s1.tn = self.tn
         inp.systems.sett.s1.aero.rho_inf = self.settings['rho']
-        inp.systems.sett.s1.aero.u_inf = u_inf
+        inp.systems.sett.s1.aero.u_inf = self.settings['u_inf']
         inp.systems.sett.s1.aero.c_ref = self.settings['c_ref']
-        inp.systems.sett.s1.xloads.modalaero_forces = self.settings['aero_on']
+        inp.systems.sett.s1.xloads.modalaero_forces = self.aero_on
         inp.systems.sett.s1.xloads.gravity_forces = self.settings['gravity_on']
         inp.systems.sett.s1.nonlinear = self.settings['nonlinear_structure']
         inp.systems.sett.s1.q0treatment = self.settings['q0_treatment']
@@ -289,58 +325,75 @@ class IntrinsicSolver(BaseSolver):
 
         # FEM Inputs
         inp.fem.connectivity = dict(A=None)             #TODO: replace with connectivity
-
         inp.fem.Ka = jnp.array(self.K)
         inp.fem.Ma = jnp.array(self.M)
-        
         inp.fem.num_modes = self.num_modes
-
-        # inp.fem.eig_type = "inputs"
         inp.fem.X = jnp.array(self.X)
         inp.fem.component_vect = self.node_names
         inp.fem.fe_order = self.node_numbers
         inp.fem.grid = None
         inp.fem.eig_names = None
-
         inp.fem.eigenvals = self.evals
         inp.fem.eigenvecs = self.evecs      
         inp.fem.eig_type = "inputs"
 
-        if self.settings['aero_on']:
-            if self.settings['aero_approx'] == 'roger':
-                self.roger_structure(inp)
-                if self.settings['gust_on']:
-                    self.roger_gust(inp)
-            elif self.settings['aero_approx'] == 'statespace':
-                self.statespace_structure(inp)
-                if self.settings['gust_on']:
-                    self.statespace_gust(inp)
+        # Structural aero inputs
+        if self.aero_on:
+            match self.aero_model:
+                case 'roger':
+                    inp.systems.sett.s1.aero.poles = -jnp.array(self.roger_poles)
+                    inp.systems.sett.s1.aero.A = jnp.array(self.roger_A)
 
-        self.calculate_n_tstep(inp)
+                case 'statespace':
+                    inp.systems.sett.s1.aero.approx = 'statespace'
+                    inp.systems.sett.s1.aero.ss_A = jnp.array(self.ss_A, dtype=float)
+                    inp.systems.sett.s1.aero.ss_B0 = jnp.array(self.ss_B0, dtype=float)
+                    inp.systems.sett.s1.aero.ss_B1 = jnp.array(self.ss_B1, dtype=float)
+                    inp.systems.sett.s1.aero.ss_C = jnp.array(self.ss_C, dtype=float)
+                    inp.systems.sett.s1.aero.ss_D0 = jnp.array(self.ss_D0, dtype=float)
+                    inp.systems.sett.s1.aero.ss_D1 = jnp.array(self.ss_D1, dtype=float)
+
+        # Gust aero inputs
+        if self.aero_on and self.gust_on:
+            col, dih = self.calculate_collocation_dihedral()
+            inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
+            inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
+            inp.systems.sett.s1.aero.gust_profile = "mc"
+            inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
+            inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
+            inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
+            inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
+
+            match self.aero_model:
+                case 'roger':
+                    inp.systems.sett.s1.aero.D = jnp.array(self.roger_D)
+                case 'statespace':
+                    assert self.ss_Bw is not None and self.ss_Dw is not None, "No gust matrices in statespace"
+                    inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.ss_Bw[:, 2::3], dtype=float)
+                    inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.ss_Dw[:, 2::3], dtype=float)
+
         return inp
 
-    def roger_structure(self, inp: Inputs) -> None:
+    def roger_structure(self) -> None:
         """
-        Generate settings for Roger structural aero
+        Convert matrix for Roger structural aero
         """
 
         if not hasattr(self.data.linear, 'rfa'):
             raise AttributeError("RFA postproccesor needs to be run")
         
         # Aero due to structure
-        A = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], 
-                    self.settings['num_modes']], dtype=float)
-        A[0, :, :] = self.data.linear.rfa.matrices_q[0]
-        A[1, :, :] = self.data.linear.rfa.matrices_q[1]
+        self.roger_poles = self.data.linear.rfa.poles
+            
+        self.roger_A = np.zeros([3 + len(self.roger_poles), self.num_modes, self.num_modes], dtype=float)
+        self.roger_A[0, :, :] = self.data.linear.rfa.matrices_q[0]
+        self.roger_A[1, :, :] = self.data.linear.rfa.matrices_q[1]
         for i_mat in range(len(self.data.linear.rfa.poles)):
-            A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
+            self.roger_A[i_mat+3, :, :] = self.data.linear.rfa.matrices_q[i_mat+2]
 
-        inp.systems.sett.s1.aero.poles = -jnp.array(self.data.linear.rfa.poles)
-        inp.systems.sett.s1.aero.A = jnp.array(A)
-
-    def roger_gust(self, inp: Inputs) -> None:
+    def roger_gust(self) -> None:
         """
-        Generate settings for Roger gust
+        Convert matrix for Roger gust
         """
                 
         # Check RFA exists
@@ -356,27 +409,12 @@ class IntrinsicSolver(BaseSolver):
 
         # Create gust matrices for leading edge panels only
         n_w = len(leading_edge_index)
-        D = np.zeros([3 + len(self.data.linear.rfa.poles), self.settings['num_modes'], n_w], dtype=float)
-        D[0, :, :] = self.data.linear.rfa.matrices_w[0][:, [3*i for i in leading_edge_index]]
+        self.roger_D = np.zeros([3 + len(self.data.linear.rfa.poles), self.num_modes, n_w], dtype=float)
+        self.roger_D[0, :, :] = self.data.linear.rfa.matrices_w[0][:, [3*i for i in leading_edge_index]]
         for i_mat in range(len(self.data.linear.rfa.poles)):
-            D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1][:, [3*i for i in leading_edge_index]]   
+            self.roger_D[i_mat+3, :, :] = self.data.linear.rfa.matrices_w[i_mat+1][:, [3*i for i in leading_edge_index]]   
 
-        # Collocation point coordinates and dihedral for leading edge panels
-        col, dih = self.calculate_collocation_dihedral()
-        col_le = col[leading_edge_index, :]
-        dih_le = dih[leading_edge_index]
-
-        inp.systems.sett.s1.aero.D = jnp.array(D)
-        inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih_le)
-        inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col_le)
-
-        inp.systems.sett.s1.aero.gust_profile = "mc"
-        inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
-        inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
-        inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
-        inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
-
-    def statespace_structure(self, inp: Inputs) -> None:
+    def statespace_structure(self) -> None:
         """
         Convert statespace system from discrete to continuous time and partition by input
         """
@@ -406,60 +444,38 @@ class IntrinsicSolver(BaseSolver):
         # Split into three state space systems for each input
         # The A and C matrices are constant between the three
 
-        B0 = None
-        B1 = None
-        D0 = None
-        D1 = None
-        self.Bw = None
-        self.Dw = None
+        self.ss_A = self.ss_c.A
+        self.ss_C = self.ss_c.C
+        self.ss_B0 = None
+        self.ss_B1 = None
+        self.ss_D0 = None
+        self.ss_D1 = None
+        self.ss_Bw = None
+        self.ss_Dw = None
+
+        self.num_lags = self.ss_A.shape[0]
 
         for i_s in range(self.data.linear.ss.input_variables.num_variables):
             var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
             param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
             match var_name:
                 case 'q':
-                    B0 = self.ss_c.B[:, param_index] 
-                    D0 = self.ss_c.D[:, param_index]
+                    self.ss_B0 = self.ss_c.B[:, param_index] 
+                    self.ss_D0 = self.ss_c.D[:, param_index]
                 case 'q_dot':
-                    B1 = self.ss_c.B[:, param_index]
-                    D1 = self.ss_c.D[:, param_index]
+                    self.ss_B1 = self.ss_c.B[:, param_index]
+                    self.ss_D1 = self.ss_c.D[:, param_index]
                 case 'u_gust':
-                    self.Bw = self.ss_c.B[:, param_index]
-                    self.Dw = self.ss_c.D[:, param_index]
+                    self.ss_Bw = self.ss_c.B[:, param_index]
+                    self.ss_Dw = self.ss_c.D[:, param_index]
 
-        assert not (B0 is None or B1 is None or D0 is None or D1 is None), \
+        assert not (self.ss_B0 is None 
+                    or self.ss_B1 is None 
+                    or self.ss_D0 is None 
+                    or self.ss_D1 is None), \
                 "Missing partition of state space inputs"
-        
-        inp.systems.sett.s1.aero.approx = 'statespace'
-        inp.systems.sett.s1.aero.ss_A = jnp.array(self.ss_c.A, dtype=float)
-        inp.systems.sett.s1.aero.ss_B0 = jnp.array(B0, dtype=float)
-        inp.systems.sett.s1.aero.ss_B1 = jnp.array(B1, dtype=float)
-        inp.systems.sett.s1.aero.ss_C = jnp.array(self.ss_c.C, dtype=float)
-        inp.systems.sett.s1.aero.ss_D0 = jnp.array(D0, dtype=float)
-        inp.systems.sett.s1.aero.ss_D1 = jnp.array(D1, dtype=float)
 
-    def statespace_gust(self, inp: Inputs) -> None:
-        """
-        Generate settings for statespace gust
-        """
-
-        assert not (self.Bw is None or self.Dw is None), \
-            "Missing partition of state space inputs"
-
-        col, dih = self.calculate_collocation_dihedral()
-
-        inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.Bw[:, 2::3], dtype=float)
-        inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.Dw[:, 2::3], dtype=float)
-        inp.systems.sett.s1.aero.gust.panels_dihedral = jnp.array(dih)
-        inp.systems.sett.s1.aero.gust.collocation_points = jnp.array(col)
-
-        inp.systems.sett.s1.aero.gust_profile = "mc"
-        inp.systems.sett.s1.aero.gust.intensity = self.settings['gust_intensity']
-        inp.systems.sett.s1.aero.gust.length = self.settings['gust_length']
-        inp.systems.sett.s1.aero.gust.step = self.settings['gust_length']/self.settings['gust_num_x']
-        inp.systems.sett.s1.aero.gust.shift = self.settings['gust_offset']
-
-    def calculate_n_tstep(self, inp: Inputs) -> None:
+    def calculate_n_tstep(self) -> None:
         """
         Determine number of time steps for simulation
         """
@@ -470,19 +486,17 @@ class IntrinsicSolver(BaseSolver):
             case 'input':
                 dt = self.settings['dt']
             case 'eivenvalues':
-                if self.settings['aero_approx'] == 'roger' or not self.settings['aero_on']:
-                    dt = 1/(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
-                elif self.settings['aero_approx'] == 'statespace':
-                    dt_struct = 1/(2*np.sqrt(self.evals[self.settings['num_modes']-1]))
-                    dt_aero = 1/(2*np.max(np.linalg.eig(self.ss_c.A)[0].imag))               # For dimensional aero
+                if self.aero_model == 'roger' or not self.aero_on:
+                    dt = 1/(2*np.sqrt(self.evals[self.num_modes-1]))
+                elif self.aero_model== 'statespace':
+                    dt_struct = 1/(2*np.sqrt(self.evals[self.num_modes-1]))
+                    dt_aero = 1/(2*np.max(np.linalg.eig(self.ss_A)[0].imag))               # For dimensional aero
                     
                     cout.cout_wrap(f"Required structure time stepsize: {dt_struct:4f}", 1)
                     cout.cout_wrap(f"Required aero time steps per second: {dt_aero:4f}", 1)
                     dt = min(dt_struct, dt_aero)
 
-        tn = int(self.settings['t1']/(dt * self.settings['dt_factor']))
-        inp.systems.sett.s1.tn = tn
-        cout.cout_wrap(f"Number of time steps: {tn}", 0)
+        self.tn = int(self.settings['t1']/(dt * self.settings['dt_factor']))
 
     def jig_loads(self) -> None:
         """
@@ -525,22 +539,49 @@ class IntrinsicSolver(BaseSolver):
 
         self.M = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['M']
         self.K = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['K']
-        self.num_modes = self.settings['num_modes']
-
-        # invMK = np.linalg.solve(self.M, self.K)
-        # evals, evecs = np.linalg.eig(invMK)                 # Eigendecomposition for mode shapes and natural frequencies
-
-        # M_diag = evecs.T @ self.M @ evecs                    
-        # evecs @= np.diag(1/np.sqrt(np.diag(M_diag)))       # Scale eigenvectors to give identity mass matrix
-
-        # order_i = np.argsort(evals)                         # Order for increasing eigenvalues
-
-        # self.evecs_full = evecs[:, order_i]
-        # self.evals_full = evals[order_i]
-
-
-        # self.evals = self.evals_full[:self.num_modes]
-        # self.evecs = self.evecs_full[:, :self.num_modes]
 
         self.evals = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvalues']
         self.evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
+
+    def check_stability(self) -> None:
+        if self.aero_model != 'statespace':
+            cout.cout_wrap("Stability analysis can only be performed with statespace aero - skipping", 1)
+            return
+        
+        # Check stability of original aeroelastic state space
+        cout.cout_wrap("Calculating aerodynamic state space stability", 0)
+        evals_oae, _ = np.linalg.eig(self.data.linear.ss.A)
+        if np.any(np.where(np.abs(evals_oae) > 1.0, 1, 0)):
+            cout.cout_wrap("\tSystem unstable", 1) 
+        else:
+            cout.cout_wrap("\tSystem stable", 1)
+
+        # Check aero stability
+        cout.cout_wrap("Calculating aerodynamic state space stability", 0)
+        evals_a, _ = np.linalg.eig(self.ss_A)
+        if np.any(np.where(np.real(evals_a) > 0.0, 1, 0)):
+            cout.cout_wrap("\tSystem unstable", 1) 
+        else:
+            cout.cout_wrap("\tSystem stable", 1)
+
+        # Check aeroelastic stability
+        cout.cout_wrap("Calculating linear aeroelastic state space stability", 0)
+        omega = np.diag(np.sqrt(self.evals))
+        iomega = np.diag(1/np.sqrt(self.evals))
+        A_ae = np.vstack((
+            np.hstack((self.ss_D1, omega - self.ss_D0 @ iomega, self.ss_C)),
+            np.hstack((-omega, np.zeros((self.num_modes, self.num_modes + self.num_lags)))),
+            np.hstack((self.ss_B1, -self.ss_B0 @ iomega, self.ss_A))))
+
+        evals_ae, _ = np.linalg.eig(A_ae)
+        unstable_i_ae = np.where(np.real(evals_ae) > 0.0, 1, 0)
+        if np.any(unstable_i_ae):
+            cout.cout_wrap("\tSystem unstable", 1)
+            evals_unstable_ae = np.extract(unstable_i_ae, evals_ae)
+            cout.cout_wrap(f"\tNumber of unstable eigenvalues: {len(evals_unstable_ae)}", 1)
+            for eval in evals_unstable_ae:
+                cout.cout_wrap(f"\t\t{np.real(eval):02f} + {np.imag(eval):02f}i", 2)
+        else:
+            cout.cout_wrap("\tSystem stable", 1)
+
+        return

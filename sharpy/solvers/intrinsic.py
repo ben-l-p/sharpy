@@ -73,7 +73,7 @@ class IntrinsicSolver(BaseSolver):
     settings_description['component_names'] = 'Name components of the structure. Will use lettering [A, B, ...] by default'
 
     settings_types['d2c_method'] = 'str'
-    settings_default['d2c_method'] = 'foh'
+    settings_default['d2c_method'] = 'tustin'
     settings_description ['d2c_method'] = 'Method for converting state space from discrete to continuous time'
     settings_options['d2c_method'] = ['zoh', 'zoha', 'foh', 'tustin']
 
@@ -223,6 +223,7 @@ class IntrinsicSolver(BaseSolver):
         self.calculate_eigs()
         self.jig_loads()
 
+        # Add aero attributes from input aero model
         self.aero_model = self.settings['aero_approx']
         self.gust_on = self.settings['gust_on']
         self.aero_on = self.settings['aero_on']
@@ -234,9 +235,11 @@ class IntrinsicSolver(BaseSolver):
             elif self.aero_model == 'statespace':
                 self.statespace_structure()
 
+        # Determine number of time steps
         self.calculate_n_tstep()
         cout.cout_wrap(f"Number of time steps: {self.tn}", 0)
 
+        # Check system eigenvalues
         self.check_stability()
 
         # Generate case object
@@ -420,22 +423,22 @@ class IntrinsicSolver(BaseSolver):
         """
 
         # Remove structural states
-        states_keep = []
+        self.states_keep = []
         for i_s in range(self.data.linear.ss.state_variables.num_variables):
             if self.data.linear.ss.state_variables.vector_variables[i_s].name not in ['q', 'q_dot']:
-                states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
+                self.states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
         
         # Remove non-forcing outputs
-        outputs_keep = []
+        self.outputs_keep = []
         for i_s in range(self.data.linear.ss.output_variables.num_variables):
             if self.data.linear.ss.output_variables.vector_variables[i_s].name == 'Q':
-                outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
+                self.outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
 
         # Truncate states and outputs
-        ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(states_keep, states_keep)], \
-                                self.data.linear.ss.B[states_keep, :], \
-                                self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)], \
-                                self.data.linear.ss.D[outputs_keep, :], \
+        ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(self.states_keep, self.states_keep)], \
+                                self.data.linear.ss.B[self.states_keep, :], \
+                                self.data.linear.ss.C[np.ix_(self.outputs_keep, self.states_keep)], \
+                                self.data.linear.ss.D[self.outputs_keep, :], \
                                 self.data.linear.ss.dt)
         
         # Convert to continuous time state space model
@@ -544,12 +547,29 @@ class IntrinsicSolver(BaseSolver):
         self.evecs = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
 
     def check_stability(self) -> None:
+        """
+        Assess the stability of the contructed aeroelastic system
+        """
+
+        r"""Stability in continuous time can be checked through construction of aeroelastic statespace form, with the state matrix defined as
+        \begin{equation} \mathbf{A}_{AE} =
+            \begin{bmatrix}
+                \mathbf{D}_{1} & \mathbf{\Omega} - \mathbf{D}_0 \mathbf{\Omega}^{-1} & \mathbf{C} \\
+                -\mathbf{\Omega} & \mathbf{0} & \mathbf{0} \\
+                \mathbf{B}_1 & -\mathbf{B}_0 \mathbf{\Omega}^{-1} & \mathbf{A}
+            \end{bmatrix}
+        \end{equation}
+        for the aerodynamic system $\mathbf{\Sigma}_A = \{\mathbf{A, B, C, D}\}$ and system states 
+        $\textbf{x}_{AE} = \{\mathbf{q}_1; \mathbf{q}_2; \mathbf{x}_A\}$ to give $\dot{\mathbf{x}}_{AE} = \mathbf{A}_{AE} \mathbf{x}_{AE}$. 
+        The stability can be verified with analysis of the eigenvalues of $\mathbf{A}_{AE}$. 
+        This uses the identity $\mathbf{q}_0 = \mathbf{q}_2 \mathbf{\Omega}^{-1}$."""
+            
         if self.aero_model != 'statespace':
             cout.cout_wrap("Stability analysis can only be performed with statespace aero - skipping", 1)
             return
         
         # Check stability of original aeroelastic state space
-        cout.cout_wrap("Calculating aerodynamic state space stability", 0)
+        cout.cout_wrap("Calculating discrete time aeroelastic state space stability", 0)
         evals_oae, _ = np.linalg.eig(self.data.linear.ss.A)
         if np.any(np.where(np.abs(evals_oae) > 1.0, 1, 0)):
             cout.cout_wrap("\tSystem unstable", 1) 
@@ -557,15 +577,15 @@ class IntrinsicSolver(BaseSolver):
             cout.cout_wrap("\tSystem stable", 1)
 
         # Check aero stability
-        cout.cout_wrap("Calculating aerodynamic state space stability", 0)
+        cout.cout_wrap("Calculating continuous time aerodynamic state space stability", 0)
         evals_a, _ = np.linalg.eig(self.ss_A)
-        if np.any(np.where(np.real(evals_a) > 0.0, 1, 0)):
+        if np.any(np.where(np.real(evals_a) > 1e-5, 1, 0)):
             cout.cout_wrap("\tSystem unstable", 1) 
         else:
             cout.cout_wrap("\tSystem stable", 1)
 
         # Check aeroelastic stability
-        cout.cout_wrap("Calculating linear aeroelastic state space stability", 0)
+        cout.cout_wrap("Calculating continuous time linear aeroelastic state space stability", 0)
         omega = np.diag(np.sqrt(self.evals))
         iomega = np.diag(1/np.sqrt(self.evals))
         A_ae = np.vstack((
@@ -574,7 +594,7 @@ class IntrinsicSolver(BaseSolver):
             np.hstack((self.ss_B1, -self.ss_B0 @ iomega, self.ss_A))))
 
         evals_ae, _ = np.linalg.eig(A_ae)
-        unstable_i_ae = np.where(np.real(evals_ae) > 0.0, 1, 0)
+        unstable_i_ae = np.where(np.real(evals_ae) > 1e-5, 1, 0)
         if np.any(unstable_i_ae):
             cout.cout_wrap("\tSystem unstable", 1)
             evals_unstable_ae = np.extract(unstable_i_ae, evals_ae)
@@ -584,4 +604,12 @@ class IntrinsicSolver(BaseSolver):
         else:
             cout.cout_wrap("\tSystem stable", 1)
 
-        return
+        # DEBUG CODE
+        # import scipy.io as spio
+        # spio.savemat(f"test_case/A_{self.settings['d2c_method']}.mat", 
+        #                     {"A_aed": self.data.linear.ss.A, 
+        #                        "A_ac": self.ss_A,
+        #                        "A_aec": A_ae,
+        #                        "A_ad": self.data.linear.ss.A[np.ix_(self.states_keep, self.states_keep)],
+        #                        "dt": self.data.linear.ss.dt,
+        #                        "method": self.settings['d2c_method']})

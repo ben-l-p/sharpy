@@ -3,6 +3,7 @@ import numpy as np
 import jax.numpy as jnp
 import pyyeti
 import typing
+import warnings
 
 # General SHARPy imports
 from sharpy.utils.solver_interface import solver, BaseSolver
@@ -216,6 +217,7 @@ class IntrinsicSolver(BaseSolver):
             self.q = np.array(sol.dynamicsystem_s1.q)
             self.ra = np.array(sol.dynamicsystem_s1.ra)
             self.t = np.array(sol.dynamicsystem_s1.t)
+            self.eta_a_jig = None
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
         # Create all case inputs
@@ -255,6 +257,7 @@ class IntrinsicSolver(BaseSolver):
             cout.cout_wrap("\tWarning - output contains NaN or Inf values", 1)
 
         intrinsic_out = self.Intrinsic_Obj(sol)
+        intrinsic_out.eta_a_jig = self.fm_jig_modal
         self.data.intrinsic = intrinsic_out
 
         return self.data
@@ -355,6 +358,7 @@ class IntrinsicSolver(BaseSolver):
                     inp.systems.sett.s1.aero.ss_C = jnp.array(self.ss_C, dtype=float)
                     inp.systems.sett.s1.aero.ss_D0 = jnp.array(self.ss_D0, dtype=float)
                     inp.systems.sett.s1.aero.ss_D1 = jnp.array(self.ss_D1, dtype=float)
+                    inp.systems.sett.s1.aero.eta_a_jig = jnp.array(self.fm_jig_modal, dtype=float)
 
         # Gust aero inputs
         if self.aero_on and self.gust_on:
@@ -524,6 +528,7 @@ class IntrinsicSolver(BaseSolver):
                     r_skew = algebra.skew(r)
                     m_node[:, i_N] += r_skew @ f_surf[:, i_M, i_N]
 
+            # Create vector of jig aerodynamic forces and moments at each node
             fm_nodal = np.zeros(N*6)
             fm_nodal[0::6] = f_node[0, :]
             fm_nodal[1::6] = f_node[1, :]
@@ -532,7 +537,11 @@ class IntrinsicSolver(BaseSolver):
             fm_nodal[4::6] = m_node[1, :]
             fm_nodal[5::6] = m_node[2, :]
 
-            self.fm_jig_nodal = fm_nodal
+            # Remove forces at root and project onto modes
+            self.fm_jig_modal = self.evecs.T @ fm_nodal[6:]     
+            cout.cout_wrap(f"\tJig shape modal forcing:", 1)
+            for eta in self.fm_jig_modal:
+                cout.cout_wrap(f"\t\t{eta:.2f}", 2)
 
     def calculate_eigs(self) -> None:
         """
@@ -565,13 +574,14 @@ class IntrinsicSolver(BaseSolver):
         This uses the identity $\mathbf{q}_0 = \mathbf{q}_2 \mathbf{\Omega}^{-1}$."""
             
         if self.aero_model != 'statespace':
-            cout.cout_wrap("Stability analysis can only be performed with statespace aero - skipping", 1)
+            cout.cout_wrap("Stability analysis can only be performed with statespace aero - skipping", 0)
             return
         
         # Check stability of original aeroelastic state space
         cout.cout_wrap("Calculating discrete time aeroelastic state space stability", 0)
         evals_oae, _ = np.linalg.eig(self.data.linear.ss.A)
-        if np.any(np.where(np.abs(evals_oae) > 1.0, 1, 0)):
+        unstable_i_aed = np.where(np.abs(evals_oae) > 1.0, 1, 0)
+        if np.any(unstable_i_aed):
             cout.cout_wrap("\tSystem unstable", 1) 
         else:
             cout.cout_wrap("\tSystem stable", 1)
@@ -594,22 +604,15 @@ class IntrinsicSolver(BaseSolver):
             np.hstack((self.ss_B1, -self.ss_B0 @ iomega, self.ss_A))))
 
         evals_ae, _ = np.linalg.eig(A_ae)
-        unstable_i_ae = np.where(np.real(evals_ae) > 1e-5, 1, 0)
-        if np.any(unstable_i_ae):
+        unstable_i_aec = np.where(np.real(evals_ae) > 1e-5, 1, 0)
+        if np.any(unstable_i_aec):
             cout.cout_wrap("\tSystem unstable", 1)
-            evals_unstable_ae = np.extract(unstable_i_ae, evals_ae)
+            evals_unstable_ae = np.extract(unstable_i_aec, evals_ae)
             cout.cout_wrap(f"\tNumber of unstable eigenvalues: {len(evals_unstable_ae)}", 1)
             for eval in evals_unstable_ae:
-                cout.cout_wrap(f"\t\t{np.real(eval):02f} + {np.imag(eval):02f}i", 2)
+                cout.cout_wrap(f"\t\t{np.real(eval):.3f} + {np.imag(eval):.3f}i", 2)
         else:
             cout.cout_wrap("\tSystem stable", 1)
 
-        # DEBUG CODE
-        # import scipy.io as spio
-        # spio.savemat(f"test_case/A_{self.settings['d2c_method']}.mat", 
-        #                     {"A_aed": self.data.linear.ss.A, 
-        #                        "A_ac": self.ss_A,
-        #                        "A_aec": A_ae,
-        #                        "A_ad": self.data.linear.ss.A[np.ix_(self.states_keep, self.states_keep)],
-        #                        "dt": self.data.linear.ss.dt,
-        #                        "method": self.settings['d2c_method']})
+        if np.any(unstable_i_aec) ^ np.any(unstable_i_aed):
+            warnings.warn("Continuous time aeroelastic system does not preserve stability characteristics of discrete time system")

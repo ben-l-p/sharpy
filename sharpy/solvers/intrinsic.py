@@ -217,7 +217,10 @@ class IntrinsicSolver(BaseSolver):
             self.q = np.array(sol.dynamicsystem_s1.q)
             self.ra = np.array(sol.dynamicsystem_s1.ra)
             self.t = np.array(sol.dynamicsystem_s1.t)
-            self.eta_a_jig = None
+            self.gamma1 = np.array(sol.couplings.gamma1)
+            self.gamma2 = np.array(sol.couplings.gamma2)
+            self.eta_a_jig = np.array(sol.modalaerostatespace_s1.eta_a_jig)     # TODO: make this work for other aero models
+            self.f_jig = np.array(sol.modalaerostatespace_s1.f_jig)
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
         # Create all case inputs
@@ -257,7 +260,6 @@ class IntrinsicSolver(BaseSolver):
             cout.cout_wrap("\tWarning - output contains NaN or Inf values", 1)
 
         intrinsic_out = self.Intrinsic_Obj(sol)
-        intrinsic_out.eta_a_jig = self.fm_jig_modal
         self.data.intrinsic = intrinsic_out
 
         return self.data
@@ -279,21 +281,23 @@ class IntrinsicSolver(BaseSolver):
         self.beam_number = self.data.structure.beam_number
 
         self.num_modes = self.settings['num_modes']
-        self.node_numbers = range(-1, self.data.structure.num_node-1)         #TODO - make this use SHARPy node numbers
+        self.node_numbers = list(range(-1, self.data.structure.num_node-1))         #TODO - make this use SHARPy node numbers
         self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for _ in (0, 1)]
 
-    # Return collocation points at the leading edge of all surfaces
+        ...
+
+        # Return collocation points at the leading edge of all surfaces
     def calculate_collocation_dihedral(self):
         col = []
-        dih = []
 
         ts_data = self.data.aero.timestep_info[self.settings['use_custom_timestep']]
         for surf in ts_data.zeta:
             for i_N in range(surf.shape[2]):
                 for i_M in range(surf.shape[1]):
-                    col.append([surf[0, i_M, i_N], surf[1, i_M, i_N], surf[2, i_M, i_N]])
-                    dih.append([1.0,])      # TODO: optimise this code and add dihedral (this is already rotated in linear UVLM!)
+                    # TODO: optimise this code and add dihedral (this is already rotated in linear UVLM!)
+                    col.append([surf[0, i_M, i_N], surf[1, i_M, i_N], surf[2, i_M, i_N]]) 
 
+        dih = np.ones_like(col)
         return np.array(col), np.array(dih)
 
     def generate_settings_file(self) -> Inputs:
@@ -336,11 +340,11 @@ class IntrinsicSolver(BaseSolver):
         inp.fem.num_modes = self.num_modes
         inp.fem.X = jnp.array(self.X)
         inp.fem.component_vect = self.node_names
-        inp.fem.fe_order = self.node_numbers
+        inp.fem.fe_order = np.array(self.node_numbers)
         inp.fem.grid = None
         inp.fem.eig_names = None
-        inp.fem.eigenvals = self.evals
-        inp.fem.eigenvecs = self.evecs      
+        inp.fem.eigenvals = jnp.array(self.evals)
+        inp.fem.eigenvecs = jnp.array(self.evecs)   
         inp.fem.eig_type = "inputs"
 
         # Structural aero inputs
@@ -358,7 +362,7 @@ class IntrinsicSolver(BaseSolver):
                     inp.systems.sett.s1.aero.ss_C = jnp.array(self.ss_C, dtype=float)
                     inp.systems.sett.s1.aero.ss_D0 = jnp.array(self.ss_D0, dtype=float)
                     inp.systems.sett.s1.aero.ss_D1 = jnp.array(self.ss_D1, dtype=float)
-                    inp.systems.sett.s1.aero.eta_a_jig = jnp.array(self.fm_jig_modal, dtype=float)
+                    inp.systems.sett.s1.aero.f_jig = jnp.array(self.fm_jig_nodal, dtype=float)
 
         # Gust aero inputs
         if self.aero_on and self.gust_on:
@@ -507,7 +511,7 @@ class IntrinsicSolver(BaseSolver):
 
     def jig_loads(self) -> None:
         """
-        Calculate loads in the jig shape, present due to twist or AoA
+        Calculate loads in the jig shape in the material FoR, present due to twist or AoA
         """
 
         fm_total = self.data.aero.timestep_info[self.settings['use_custom_timestep']].forces
@@ -528,20 +532,7 @@ class IntrinsicSolver(BaseSolver):
                     r_skew = algebra.skew(r)
                     m_node[:, i_N] += r_skew @ f_surf[:, i_M, i_N]
 
-            # Create vector of jig aerodynamic forces and moments at each node
-            fm_nodal = np.zeros(N*6)
-            fm_nodal[0::6] = f_node[0, :]
-            fm_nodal[1::6] = f_node[1, :]
-            fm_nodal[2::6] = f_node[2, :]
-            fm_nodal[3::6] = m_node[0, :]
-            fm_nodal[4::6] = m_node[1, :]
-            fm_nodal[5::6] = m_node[2, :]
-
-            # Remove forces at root and project onto modes
-            self.fm_jig_modal = self.evecs.T @ fm_nodal[6:]     
-            cout.cout_wrap(f"\tJig shape modal forcing:", 1)
-            for eta in self.fm_jig_modal:
-                cout.cout_wrap(f"\t\t{eta:.2f}", 2)
+            self.fm_jig_nodal = np.vstack((f_node, m_node))
 
     def calculate_eigs(self) -> None:
         """
@@ -594,7 +585,7 @@ class IntrinsicSolver(BaseSolver):
         else:
             cout.cout_wrap("\tSystem stable", 1)
 
-        # Check aeroelastic stability
+        # Create continuous time state matrix
         cout.cout_wrap("Calculating continuous time linear aeroelastic state space stability", 0)
         omega = np.diag(np.sqrt(self.evals))
         iomega = np.diag(1/np.sqrt(self.evals))
@@ -603,6 +594,7 @@ class IntrinsicSolver(BaseSolver):
             np.hstack((-omega, np.zeros((self.num_modes, self.num_modes + self.num_lags)))),
             np.hstack((self.ss_B1, -self.ss_B0 @ iomega, self.ss_A))))
 
+        # Check stability of continuous time aeroelastic system
         evals_ae, _ = np.linalg.eig(A_ae)
         unstable_i_aec = np.where(np.real(evals_ae) > 1e-5, 1, 0)
         if np.any(unstable_i_aec):

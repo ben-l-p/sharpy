@@ -126,7 +126,6 @@ def get_mode_zeta(data, eigvect):
 
     jj = 0  # structural dofs index
     Cga0 = algebra.quat2rotation(tsstr.quat)
-    Cag0 = Cga0.T
     for node_glob in range(struct.num_node):
 
         ### detect bc at node (and no. of dofs)
@@ -144,18 +143,17 @@ def get_mode_zeta(data, eigvect):
         ee, node_loc = struct.node_master_elem[node_glob, :]
 
         # get original position and crv
-        Ra0 = tsstr.pos[node_glob, :]
-        psi0 = tsstr.psi[ee, node_loc, :]
-        Rg0 = np.dot(Cga0, Ra0)
-        Cab0 = algebra.crv2rotation(psi0)
-        Cbg0 = np.dot(Cab0.T, Cag0)
+        Ra0 = tsstr.pos[node_glob, :]       # node initial position in A frame
+        psi0 = tsstr.psi[ee, node_loc, :]   # node initial rotation in A frame
+        Rg0 = Cga0 @ Ra0             # node initial rotation in G frame
+        Cab0 = algebra.crv2rotation(psi0)   # node initial rotation in A frame
+        Cbg0 = Cab0.T @ Cga0.T       # node initial rotation in G frame
 
         # update position and crv of mode
-        Ra = tsstr.pos[node_glob, :] + eigvect[jj_tra]
-        psi = tsstr.psi[ee, node_loc, :] + eigvect[jj_rot]
-        Rg = np.dot(Cga0, Ra)
-        Cab = algebra.crv2rotation(psi)
-        Cbg = np.dot(Cab.T, Cag0)
+        Ra = tsstr.pos[node_glob, :] + eigvect[jj_tra]      # total modal position in A frame
+        psi = tsstr.psi[ee, node_loc, :] + eigvect[jj_rot]  # total modal rotation in A frame
+        Rg = Cga0 @ Ra                                      # total modal position in G frame
+        Cab = algebra.crv2rotation(psi)                     # total modal rotation in A frame
 
         ### str -> aero mapping
         # some nodes may be linked to multiple surfaces...
@@ -163,19 +161,19 @@ def get_mode_zeta(data, eigvect):
 
             # detect surface/span-wise coordinate (ss,nn)
             nn, ss = str2aero_here['i_n'], str2aero_here['i_surf']
-            # print('%.2d,%.2d'%(nn,ss))
 
             # surface panelling
-            M = aero.dimensions[ss][0]
-            N = aero.dimensions[ss][1]
+            m = aero.dimensions[ss][0]
 
-            for mm in range(M + 1):
+            for i_m in range(m + 1):
                 # get position of vertex in B FoR
-                zetag0 = tsaero.zeta[ss][:, mm, nn]  # in G FoR, w.r.t. origin A-G
-                Xb = np.dot(Cbg0, zetag0 - Rg0)  # in B FoR, w.r.t. origin B
+                # coordinate of point in original aero grid
+                zetag0 = tsaero.zeta[ss][:, i_m, nn]  # in G FoR, w.r.t. origin A-G
+
+                Xb = Cbg0 @ (zetag0 - Rg0)  # in B FoR, w.r.t. origin B
 
                 # update vertex position
-                zeta_mode[ss][:, mm, nn] = Rg + np.dot(np.dot(Cga0, Cab), Xb)
+                zeta_mode[ss][:, i_m, nn] = Rg + Cga0 @ Cab @ Cbg0 @ (zetag0 - Rg0)
 
     return zeta_mode
 

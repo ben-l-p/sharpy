@@ -73,19 +73,21 @@ class IntrinsicPlot(BaseSolver):
             self.elem_id[i_elem] = i_elem
 
         for i_t in range(0, self.n_tstep, self.settings['stride']):
-            self.write_beam(i_t)
+            valid_sol = self.write_beam(i_t)
+            if not valid_sol:
+                break
 
             self.write_aero(i_t)
 
         return self.data
 
-    def write_beam(self, i_t):
+    def write_beam(self, i_t) -> bool:
         i_t_filename = (self.filename + ('%06u' % i_t) + '.vtu')
 
-        coords = self.data.intrinsic.ra[i_t, :, :].T
+        coords = self.data.intrinsic.r_g[i_t, :, :]
 
-        if np.any(np.isnan(coords)):
-            return
+        if np.any(np.isnan(coords)) or np.any(np.isinf(coords)):
+            return False
 
         ug = tvtk.UnstructuredGrid(points=coords)
         ug.set_cells(tvtk.Line().cell_type, self.conn)
@@ -93,6 +95,8 @@ class IntrinsicPlot(BaseSolver):
         ug.cell_data.scalars.name = 'elem_id'
 
         write_data(ug, i_t_filename)
+
+        return True
 
     def write_aero(self, i_t):
         pass

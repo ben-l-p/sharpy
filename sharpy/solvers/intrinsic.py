@@ -63,7 +63,7 @@ class IntrinsicSolver(BaseSolver):
     settings_description['orientation'] = 'Quaternion used to describe rotation from inertial to body frame'
 
     settings_types['aero_approx'] = 'str'
-    settings_default['aero_approx'] = 'roger'
+    settings_default['aero_approx'] = 'statespace'
     settings_description['aero_approx'] = 'Aerodynamic model to use.'
     settings_options['aero_approx'] = ['roger', 'statespace', 'none']
 
@@ -234,7 +234,7 @@ class IntrinsicSolver(BaseSolver):
             self.X3 = np.array(sol.dynamicsystem_s1.X3)
             self.q = np.array(sol.dynamicsystem_s1.q)
             self.r_g = np.swapaxes(np.array(sol.dynamicsystem_s1.ra), 1, 2)
-            self.r_a = np.squeeze(algebra.quat2rot(orientation) @ np.expand_dims(self.r_g, -1))
+            self.r_a = np.squeeze(algebra.quat2rotation(orientation).T @ np.expand_dims(self.r_g, -1))
             self.t = np.array(sol.dynamicsystem_s1.t)
 
             try:
@@ -310,7 +310,8 @@ class IntrinsicSolver(BaseSolver):
         else:
             self.component_names = [chr(65 + i) for i in range(n_beams)]
 
-        rot_orient = algebra.quat2rot(self.settings['orientation']).T
+        # orientation is given as quat_GA
+        rot_orient = algebra.quat2rotation(self.settings['orientation'])
         # Create grid
         self.x = np.squeeze(rot_orient @ np.expand_dims(
             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos, -1))
@@ -335,7 +336,7 @@ class IntrinsicSolver(BaseSolver):
 
         tan_psi0 = np.apply_along_axis(algebra.crv2tan, axis=1, arr=psi0)
 
-        rot_orient = algebra.quat2rot(self.settings['orientation'])
+        rot_orient = algebra.quat2rotation(self.settings['orientation']).T
 
         tfrm = np.linalg.inv(block_diag(
             *[np.block([[rot_orient, np.zeros((3, 3))], [np.zeros((3, 3)), rot_orient @ tan_psi0[i + 1, ...]]])
@@ -357,7 +358,8 @@ class IntrinsicSolver(BaseSolver):
                     # TODO: optimise this code and add dihedral (this is already rotated in linear UVLM!)
                     col.append([surf[0, i_M, i_N], surf[1, i_M, i_N], surf[2, i_M, i_N]])
 
-        dih = np.ones_like(col)
+        dih = np.ones((len(col)))
+
         return np.array(col), np.array(dih)
 
     def generate_settings_file(self) -> Inputs:
@@ -457,8 +459,12 @@ class IntrinsicSolver(BaseSolver):
                     inp.systems.sett.s1.aero.D = jnp.array(self.roger_D)
                 case 'statespace':
                     assert self.ss_Bw is not None and self.ss_Dw is not None, "No gust matrices in statespace"
-                    inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.ss_Bw[:, 2::3], dtype=float)
-                    inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.ss_Dw[:, 2::3], dtype=float)
+                    # inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.ss_Bw[:, 2::3], dtype=float)
+                    # inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.ss_Dw[:, 2::3], dtype=float)
+                    n_node_aero = self.ss_Bw.shape[1] // 3
+                    inp.systems.sett.s1.aero.ss_Bw = jnp.array(self.ss_Bw[:, 2*n_node_aero:], dtype=float)
+                    inp.systems.sett.s1.aero.ss_Dw = jnp.array(self.ss_Dw[:, 2*n_node_aero:], dtype=float)
+
 
         return inp
 
@@ -587,7 +593,11 @@ class IntrinsicSolver(BaseSolver):
                     r_skew = algebra.skew(r)
                     m_node[:, i_N] += r_skew @ f_surf[:, i_M, i_N]
 
-            self.fm_jig_nodal = np.vstack((f_node, m_node))
+            rmat_ga = algebra.quat2rotation(self.settings['orientation'])
+            f_node_g = rmat_ga @ f_node
+            m_node_g = rmat_ga @ m_node
+
+            self.fm_jig_nodal = np.vstack((f_node_g, m_node_g))
 
     def calculate_eigs(self) -> [np.ndarray, np.ndarray]:
         """

@@ -52,7 +52,7 @@ class Modal(BaseSolver):
 
     settings_types['print_matrices'] = 'bool'  # print M,C,K matrices to dat file
     settings_default['print_matrices'] = False
-    settings_description['print_matrices']  = 'Write M, C and K matrices to file'
+    settings_description['print_matrices'] = 'Write M, C and K matrices to file'
 
     settings_types['save_data'] = 'bool'  # write modes shapes/freq./damp. to dat file
     settings_default['save_data'] = True

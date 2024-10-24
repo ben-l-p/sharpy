@@ -1220,10 +1220,10 @@ class FlexDynamic():
 
             phi = eigenvectors[:, order]
 
-            phi = modalutils.mode_sign_convention(self.structure.boundary_conditions,
-                                                  phi,
-                                                  not self.clamped,
-                                                  self.use_euler)
+            # phi = modalutils.mode_sign_convention(self.structure.boundary_conditions,
+            #                                       phi,
+            #                                       not self.clamped,
+            #                                       self.use_euler)
 
             if not self.clamped and self.use_principal_axes:
                 phi = modalutils.free_modes_principal_axes(phi, self.Mstr, use_euler=self.use_euler)

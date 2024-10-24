@@ -140,8 +140,8 @@ That said, the recipe for a successfully documented class, function, module is t
         - Define a `settings_types`, `settings_default` and `settings_description` dictionaries.
         
         - After all your settings, update the docstring with the automatically generated settings table. You will need
-        to import the `sharpy.utils.settings` module
-        
+          to import the `sharpy.utils.settings` module
+
             ```python
             settings_types = dict()
             settings_default = dict()

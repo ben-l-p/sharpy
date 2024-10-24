@@ -56,7 +56,7 @@ class PickleData(BaseSolver):
                            self.settings_default)
 
         self.folder = data.output_folder
-        self.filename = self.folder + self.data.settings['SHARPy']['case']+'.pkl'
+        self.filename = self.folder + self.data.settings['SHARPy']['case'] + '.pkl'
         self.caller = caller
 
 

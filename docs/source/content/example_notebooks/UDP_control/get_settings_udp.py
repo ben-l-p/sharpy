@@ -25,7 +25,7 @@ def get_settings_udp(model, flow, **kwargs):
                         'write_log': 'on',
                         'save_settings': 'on',
                         'log_folder':  output_folder + '/',
-                        'log_file':  model.case_name + '.log'}
+                        'log_file': model.case_name + '.log'}
 
 
     model.config['BeamLoader'] = {'unsteady': 'off',

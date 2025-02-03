@@ -376,7 +376,7 @@ class IntrinsicFlutterSolver(BaseSolver):
                                                    kappa=self.settings['kappa'])
 
         # FEM Inputs
-        inp.fem.connectivity = dict(A=None)  # TODO: replace with connectivity
+        inp.fem.connectivity = {name: None for name in self.component_names}  # TODO: replace with connectivity
         inp.fem.num_modes = self.num_modes
         inp.fem.X = jnp.array(self.x)
         inp.fem.component_vect = self.node_names
@@ -456,7 +456,9 @@ class IntrinsicFlutterSolver(BaseSolver):
 
         fm_total = self.data.aero.timestep_info[self.settings['use_custom_timestep']].forces
 
-        for i_surf in range(len(fm_total)):  # TODO: support multiple surfaces
+        self.fm_jig_nodal = np.zeros((6, self.data.structure.num_node))
+
+        for i_surf in range(len(fm_total)):
             f_surf = fm_total[i_surf][:3, ...]  # 3 x M+1 x N+1
             f_node = np.sum(f_surf, 1)
 
@@ -468,7 +470,9 @@ class IntrinsicFlutterSolver(BaseSolver):
             m_node = np.zeros_like(f_node)
             for i_N in range(n):
                 for i_M in range(m):
-                    r = zeta[i_surf][:, i_M, i_N] - beam_pos[i_N, :]
+                    i_beam = self.data.aero.aero2struct_mapping[i_surf][i_N]
+
+                    r = zeta[i_surf][:, i_M, i_N] - beam_pos[i_beam, :]
                     r_skew = algebra.skew(r)
                     m_node[:, i_N] += r_skew @ f_surf[:, i_M, i_N]
 
@@ -476,8 +480,8 @@ class IntrinsicFlutterSolver(BaseSolver):
             f_node_g = rmat_ga @ f_node
             m_node_g = rmat_ga @ m_node
 
-            self.fm_jig_nodal = np.vstack((f_node_g, m_node_g))
-            self.fm_jig_modal = jnp.einsum('ijk, jk->i', self.phi1, self.fm_jig_nodal)
+            self.fm_jig_nodal[:, self.data.aero.aero2struct_mapping[i_surf]] += np.vstack((f_node_g, m_node_g))
+        self.fm_jig_modal = jnp.einsum('ijk, jk->i', self.phi1, self.fm_jig_nodal)
 
     def calculate_eigs(self) -> [np.ndarray, np.ndarray]:
         """
@@ -486,27 +490,64 @@ class IntrinsicFlutterSolver(BaseSolver):
         """
 
         evecs_modal = self.data.structure.timestep_info[self.settings['use_custom_timestep']].modal['eigenvectors']
-
         evals_global, evecs_global = np.linalg.eig(np.linalg.inv(self.m_global) @ self.k_global)
-
         i_order = np.argsort(evals_global)[:self.num_modes]
         evals_global = evals_global[i_order]
         evecs_global = evecs_global[:, i_order]
 
-        tip_disp_modal = np.linalg.norm(evecs_modal[-6:-3, :], axis=0)
-        tip_disp_global = np.linalg.norm(evecs_global[-6:-3, :], axis=0)
+        end_indices = np.where(self.data.structure.boundary_conditions == -1)[0]    # array of all end index
+        overall_scaling = np.zeros(self.num_modes)              # values per mode
+        has_been_scaled = np.zeros(self.num_modes, dtype=bool)  # bool if mode is already scaled
 
-        elem_size_m = evecs_modal[-6:-3, :][np.argmax(np.abs(evecs_modal[-6:-3, :]), axis=0), np.arange(self.num_modes)]
-        is_neg_m = np.array([-1. if e < 0. else 1. for e in elem_size_m])
+        has_disp_global = np.zeros((end_indices.shape[0], self.num_modes), dtype=bool)
+        has_disp_modal = np.zeros((end_indices.shape[0], self.num_modes), dtype=bool)
+        for i_end, end in enumerate(end_indices):
+            for i_mode in range(self.num_modes):
+                has_disp_global[i_end, i_mode] = np.any(evecs_global[(end - 1) * 6:end * 6, i_mode])
+                has_disp_modal[i_end, i_mode] = np.any(evecs_modal[(end - 1) * 6:end * 6, i_mode])
 
-        elem_size_g = evecs_global[-6:-3, :][
-            np.argmax(np.abs(evecs_global[-6:-3, :]), axis=0), np.arange(self.num_modes)]
-        is_neg_g = np.array([-1. if e < 0. else 1. for e in elem_size_g])
+        # order modes the same in both cases
+        evals_set = sorted(list(set(np.round(evals_global, 5))))
+        new_order = np.zeros(self.num_modes, dtype=int)
+        mode_count = 0
+        for i_eval, eval in enumerate(evals_set):
+            i_modes_modal = np.where(np.abs(evals_global - eval) < 1e-4)[0]
 
-        scaling = tip_disp_modal / tip_disp_global * is_neg_g * is_neg_m
+            match len(i_modes_modal):
+                case 1:
+                    new_order[mode_count] = mode_count
+                case 2:
+                    if np.all(has_disp_global[:, mode_count:mode_count + 2] == has_disp_modal[:, mode_count:mode_count + 2]):
+                        new_order[mode_count:mode_count + 2] = [mode_count, mode_count + 1]
+                    else:
+                        new_order[mode_count:mode_count + 2] = [mode_count + 1, mode_count]
+                case _:
+                    raise ValueError
+            mode_count += i_modes_modal.shape[0]
+        evecs_global = evecs_global[:, new_order]
 
-        evecs_scaled = evecs_global @ np.diag(scaling)
+        # scale modes to keep displacements at the first displaced free end consistent
+        for i_end in end_indices:
+            slice_end = slice((i_end - 1) * 6, (i_end - 1) * 6 + 3)
+
+            tip_disp_modal = np.linalg.norm(evecs_modal[slice_end, :], axis=0)
+            tip_disp_global = np.linalg.norm(evecs_global[slice_end, :], axis=0)
+
+            is_neg_m = np.sign(evecs_modal[slice_end, :][np.argmax(np.abs(evecs_modal[slice_end, :]), axis=0), np.arange(self.num_modes)])
+            is_neg_g = np.sign(evecs_global[slice_end, :][np.argmax(np.abs(evecs_global[slice_end, :]), axis=0), np.arange(self.num_modes)])
+
+            scaling = tip_disp_modal / tip_disp_global * is_neg_g * is_neg_m
+
+            is_valid_scaling = ~np.isnan(scaling) & (scaling != 0.0)
+            overall_scaling += np.nan_to_num(scaling * is_valid_scaling * ~has_been_scaled)    # scale modes if values are valid and isnt already scaled
+            has_been_scaled |= is_valid_scaling     # update mask of scaled modes
+
+            if np.all(has_been_scaled):
+                break
+
+        evecs_scaled = evecs_global @ np.diag(overall_scaling)
         return evals_global, evecs_scaled
+
 
     def find_static_sol(self) -> None:
         """

@@ -162,10 +162,15 @@ class IntrinsicFlutterSolver(BaseSolver):
     settings_default['max_iter'] = 100
     settings_description['max_iter'] = 'Maximum number of iterations for finding static solution'
 
+    settings_types['remove_symmetric'] = 'bool'
+    settings_default['remove_symmetric'] = True
+    settings_description['remove_symmetric'] = 'Remove symmetric modes'
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
 
     def __init__(self):
+        self.input = None
         self.evecs_ae = None
         self.evals_ae = None
         self.sys_mat = None
@@ -261,8 +266,8 @@ class IntrinsicFlutterSolver(BaseSolver):
             raise KeyError(f"Aero model {self.aero_model} not recognised")
 
         # Generate case object
-        input = self.generate_settings_file()
-        config = Config(input)
+        self.input = self.generate_settings_file()
+        config = Config(self.input)
 
         # Run case
         cout.cout_wrap("\nRunning Intrinsic Solver", 0)
@@ -277,9 +282,19 @@ class IntrinsicFlutterSolver(BaseSolver):
         self.gamma2 = np.array(self.data.intrinsic.gamma2)
         self.omega = np.array(self.data.intrinsic.omega)
 
+        # if self.settings['remove_symmetric']:
+        #     new_phi1 = np.zeros((self.num_modes // 2, *self.phi1.shape[1:]))
+        #     for i_mode in range(self.num_modes // 2):
+        #         new_phi1[i_mode, ...] = self.phi1[2 * i_mode, ...]
+        #         new_phi1[i_mode, ...] += self.phi1[2 * i_mode + 1, ...]
+        #     self.phi1 = new_phi1
+        #     self.omega = self.omega[::2]
+        #     self.gamma1 = self.gamma1[::2, ::2, ::2]
+        #     self.gamma2 = self.gamma2[::2, ::2, ::2]
+
         self.jig_loads()
 
-        self.find_static_sol()
+        self.data.intrinsic.flutter['r_bar'] = self.find_static_sol()
         sys_mat = self.assemble_sys()
 
         self.data.intrinsic.flutter['q2_bar'] = self.q2_bar
@@ -308,11 +323,11 @@ class IntrinsicFlutterSolver(BaseSolver):
         # Create grid
         self.x = np.squeeze(rot_orient @ np.expand_dims(
             self.data.structure.timestep_info[self.settings['use_custom_timestep']].pos, -1))
-        self.conn = self.data.structure.connectivities      # SHARPy format
+        self.conn = self.data.structure.connectivities  # SHARPy format
         self.beam_number = self.data.structure.beam_number  # [num_elem]
 
         self.num_modes = self.settings['num_modes']
-        self.node_numbers = self.data.structure.global_nodes_num - 1    # take away one to make 0 the reference
+        self.node_numbers = self.data.structure.global_nodes_num - 1  # take away one to make 0 the reference
 
         self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for _ in
                                                        (0, 1)]
@@ -388,6 +403,28 @@ class IntrinsicFlutterSolver(BaseSolver):
         inp.fem.eigenvals = jnp.array(self.evals_struct)
         inp.fem.eigenvecs = jnp.array(self.evecs_struct)
         inp.fem.eig_type = "inputs"
+
+        if self.settings['remove_symmetric']:
+            num_nodes = (inp.fem.X.shape[0] + 1) // 2
+            keep_nodes = slice(0, num_nodes)
+            keep_dof = slice(0, inp.fem.Ma.shape[0] // 2)
+
+            inp.fem.X = inp.fem.X[keep_nodes, :]
+            eigen_to_keep = (np.abs(inp.fem.eigenvecs[2, :]) > 1e-10)
+
+            inp.fem.eigenvals = inp.fem.eigenvals[eigen_to_keep]
+            inp.fem.eigenvecs = inp.fem.eigenvecs[keep_dof, eigen_to_keep]
+
+            inp.fem.Ka = inp.fem.Ka[keep_dof, keep_dof]
+            inp.fem.Ma = inp.fem.Ma[keep_dof, keep_dof]
+
+            inp.fem.connectivity = {"A": None}
+
+            inp.fem.num_modes = int(inp.fem.num_modes / 2)
+            inp.fem.component_vect = inp.fem.component_vect[keep_nodes]
+            inp.fem.fe_order = inp.fem.fe_order[keep_nodes]
+
+            pass
 
         return inp
 
@@ -481,7 +518,12 @@ class IntrinsicFlutterSolver(BaseSolver):
             m_node_g = rmat_ga @ m_node
 
             self.fm_jig_nodal[:, self.data.aero.aero2struct_mapping[i_surf]] += np.vstack((f_node_g, m_node_g))
-        self.fm_jig_modal = jnp.einsum('ijk, jk->i', self.phi1, self.fm_jig_nodal)
+
+        if self.settings['remove_symmetric']:
+            keep_nodes = slice(0, (self.data.structure.num_node + 1) // 2)
+            self.fm_jig_modal = jnp.einsum('ijk, jk->i', self.phi1, self.fm_jig_nodal[:, keep_nodes])
+        else:
+            self.fm_jig_modal = jnp.einsum('ijk, jk->i', self.phi1, self.fm_jig_nodal)
 
     def calculate_eigs(self) -> [np.ndarray, np.ndarray]:
         """
@@ -495,8 +537,8 @@ class IntrinsicFlutterSolver(BaseSolver):
         evals_global = evals_global[i_order]
         evecs_global = evecs_global[:, i_order]
 
-        end_indices = np.where(self.data.structure.boundary_conditions == -1)[0]    # array of all end index
-        overall_scaling = np.zeros(self.num_modes)              # values per mode
+        end_indices = np.where(self.data.structure.boundary_conditions == -1)[0]  # array of all end index
+        overall_scaling = np.zeros(self.num_modes)  # values per mode
         has_been_scaled = np.zeros(self.num_modes, dtype=bool)  # bool if mode is already scaled
 
         has_disp_global = np.zeros((end_indices.shape[0], self.num_modes), dtype=bool)
@@ -507,17 +549,18 @@ class IntrinsicFlutterSolver(BaseSolver):
                 has_disp_modal[i_end, i_mode] = np.any(evecs_modal[(end - 1) * 6:end * 6, i_mode])
 
         # order modes the same in both cases
-        evals_set = sorted(list(set(np.round(evals_global, 5))))
+        evals_set = sorted(list(set(np.round(evals_global, 4))))
         new_order = np.zeros(self.num_modes, dtype=int)
         mode_count = 0
         for i_eval, eval in enumerate(evals_set):
-            i_modes_modal = np.where(np.abs(evals_global - eval) < 1e-4)[0]
+            i_modes_modal = np.where(np.abs(evals_global - eval) < 1e-3)[0]
 
             match len(i_modes_modal):
                 case 1:
                     new_order[mode_count] = mode_count
                 case 2:
-                    if np.all(has_disp_global[:, mode_count:mode_count + 2] == has_disp_modal[:, mode_count:mode_count + 2]):
+                    if np.all(has_disp_global[:, mode_count:mode_count + 2] == has_disp_modal[:,
+                                                                               mode_count:mode_count + 2]):
                         new_order[mode_count:mode_count + 2] = [mode_count, mode_count + 1]
                     else:
                         new_order[mode_count:mode_count + 2] = [mode_count + 1, mode_count]
@@ -533,14 +576,17 @@ class IntrinsicFlutterSolver(BaseSolver):
             tip_disp_modal = np.linalg.norm(evecs_modal[slice_end, :], axis=0)
             tip_disp_global = np.linalg.norm(evecs_global[slice_end, :], axis=0)
 
-            is_neg_m = np.sign(evecs_modal[slice_end, :][np.argmax(np.abs(evecs_modal[slice_end, :]), axis=0), np.arange(self.num_modes)])
-            is_neg_g = np.sign(evecs_global[slice_end, :][np.argmax(np.abs(evecs_global[slice_end, :]), axis=0), np.arange(self.num_modes)])
+            is_neg_m = np.sign(evecs_modal[slice_end, :][
+                                   np.argmax(np.abs(evecs_modal[slice_end, :]), axis=0), np.arange(self.num_modes)])
+            is_neg_g = np.sign(evecs_global[slice_end, :][
+                                   np.argmax(np.abs(evecs_global[slice_end, :]), axis=0), np.arange(self.num_modes)])
 
             scaling = tip_disp_modal / tip_disp_global * is_neg_g * is_neg_m
 
             is_valid_scaling = ~np.isnan(scaling) & (scaling != 0.0)
-            overall_scaling += np.nan_to_num(scaling * is_valid_scaling * ~has_been_scaled)    # scale modes if values are valid and isnt already scaled
-            has_been_scaled |= is_valid_scaling     # update mask of scaled modes
+            overall_scaling += np.nan_to_num(
+                scaling * is_valid_scaling * ~has_been_scaled)  # scale modes if values are valid and isnt already scaled
+            has_been_scaled |= is_valid_scaling  # update mask of scaled modes
 
             if np.all(has_been_scaled):
                 break
@@ -548,8 +594,7 @@ class IntrinsicFlutterSolver(BaseSolver):
         evecs_scaled = evecs_global @ np.diag(overall_scaling)
         return evals_global, evecs_scaled
 
-
-    def find_static_sol(self) -> None:
+    def find_static_sol(self) -> np.array:
         """
         Find the static solution to the system
         """
@@ -557,8 +602,9 @@ class IntrinsicFlutterSolver(BaseSolver):
         gamma2 = jnp.array(self.gamma2)
         eta_jig = jnp.array(self.fm_jig_modal)
 
-        e_mat = jnp.real(jnp.array(np.diag(self.omega) + (self.ss_C @ np.linalg.inv(self.ss_A) @ self.ss_B0 - self.ss_D0)
-                          @ np.diag(1.0 / self.omega)))
+        e_mat = jnp.real(
+            jnp.array(np.diag(self.omega) + (self.ss_C @ np.linalg.inv(self.ss_A) @ self.ss_B0 - self.ss_D0)
+                      @ np.diag(1.0 / self.omega)))
 
         def f(q2: jnp.ndarray):
             return e_mat @ q2 - jnp.einsum('jik,i,k->j', gamma2, q2, q2) + eta_jig
@@ -566,13 +612,13 @@ class IntrinsicFlutterSolver(BaseSolver):
         def f_prime_inv(q2: jnp.ndarray):
             return jnp.linalg.inv(jax.jacfwd(f, argnums=0)(q2))
 
-        q2 = -jnp.ones(self.num_modes)
+        q2 = -jnp.ones_like(self.fm_jig_modal)
 
         # iterate
         for i_iter in range(self.settings['max_iter']):
             f_val = f(q2)
             res = np.linalg.norm(f_val)
-            if res < 1e-5:
+            if res < 1e-9:
                 break
             elif i_iter == self.settings['max_iter'] - 1:
                 raise RuntimeError(f"Static solution not converged, Residual: {res:.2f}")
@@ -583,6 +629,18 @@ class IntrinsicFlutterSolver(BaseSolver):
         self.q0_bar = -np.diag(1.0 / self.omega) @ self.q2_bar
         self.lambda_bar = -np.linalg.inv(self.ss_A) @ self.ss_B0 @ np.diag(1.0 / self.omega) @ self.q2_bar
 
+        # self.input.systems.sett.s1.init_states = dict(q2=["prescribed", jnp.array(self.q2_bar)])
+        if self.settings['remove_symmetric']:
+            self.input.systems.sett.s1.q0_input = np.concatenate((np.zeros(self.num_modes // 2), self.q2_bar))
+        else:
+            self.input.systems.sett.s1.q0_input = np.concatenate((np.zeros(self.num_modes), self.q2_bar))
+        self.input.systems.sett.s1.t1 = 1e-8
+
+        config = Config(self.input)
+        sol = fem4inas_main.main(input_obj=config)
+
+        return np.array(sol.dynamicsystem_s1.ra[0, ...])
+
     def assemble_sys(self) -> None:
 
         elem12 = ((np.diag(self.omega) - np.einsum('jik,k->ji', self.gamma2, self.q2_bar)
@@ -592,7 +650,12 @@ class IntrinsicFlutterSolver(BaseSolver):
         elem21 = -np.diag(self.omega) + np.einsum('ijk,k->ji', self.gamma2, self.q2_bar)
         elem32 = -self.ss_B0 @ np.diag(1.0 / self.omega)
 
-        self.sys_mat = np.block([[self.ss_D1, elem12, self.ss_C],
+        if self.settings['remove_symmetric']:
+            self.sys_mat = np.block([[self.ss_D1, elem12, self.ss_C],
+                                     [elem21, np.zeros((self.num_modes // 2, self.num_modes // 2 + self.num_lags))],
+                                     [self.ss_B1, elem32, self.ss_A]])
+        else:
+            self.sys_mat = np.block([[self.ss_D1, elem12, self.ss_C],
                                  [elem21, np.zeros((self.num_modes, self.num_modes + self.num_lags))],
                                  [self.ss_B1, elem32, self.ss_A]])
 

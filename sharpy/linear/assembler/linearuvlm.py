@@ -230,12 +230,6 @@ class LinearUVLM(ss_interface.BaseElement):
         self.tsaero0 = data.linear.tsaero0
         self.sys = uvlm
 
-        state_variables_list = [
-            VectorVariable('gamma', size=self.sys.K, index=0),
-            VectorVariable('gamma_w', size=self.sys.K_star, index=1),
-            VectorVariable('dtgamma_dot', size=self.sys.K, index=2),
-            VectorVariable('gamma_m1', size=self.sys.K, index=3),
-        ]
         self.linearisation_vectors['zeta'] = np.concatenate([self.tsaero0.zeta[i_surf].reshape(-1, order='C')
                                                              for i_surf in range(self.tsaero0.n_surf)])
         self.linearisation_vectors['zeta_dot'] = np.concatenate([self.tsaero0.zeta_dot[i_surf].reshape(-1, order='C')

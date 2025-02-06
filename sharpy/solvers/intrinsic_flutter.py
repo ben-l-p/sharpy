@@ -166,19 +166,40 @@ class IntrinsicFlutterSolver(BaseSolver):
     settings_default['remove_symmetric'] = True
     settings_description['remove_symmetric'] = 'Remove symmetric modes'
 
+    settings_types['integrate_static'] = 'bool'
+    settings_default['integrate_static'] = True
+    settings_description['integrate_static'] = 'Integrate the static solution modes to obtain cartesian coordinates'
+
+    settings_types['velocity_min'] = 'float'
+    settings_default['velocity_min'] = 20.0
+
+    settings_types['velocity_max'] = 'float'
+    settings_default['velocity_max'] = 80.0
+
+    settings_types['velocity_num'] = 'int'
+    settings_default['velocity_num'] = 0
+    settings_description['velocity_num'] = ("Number of evenly spaced velocities to use for analysis, set to 0 to use "
+                                            "reference only")
+
+
+
     settings_table = settings_utils.SettingsTable()
     __doc__ += settings_table.generate(settings_types, settings_default, settings_description)
 
     def __init__(self):
+        self.num_ae_states = None
+        self.u_infs = None
+        self.num_u_infs: Optional[int] = None
+        self.omega = None
+        self.evals_struct = None
+        self.evecs_struct = None
         self.input = None
         self.evecs_ae = None
         self.evals_ae = None
-        self.sys_mat = None
         self.data = Optional[sharpy.presharpy.presharpy.PreSharpy]
         self.settings: Optional[dict] = None
         self.m_global: Optional[np.ndarray] = None
         self.k_global: Optional[np.ndarray] = None
-        self.tn: Optional[int] = None
         self.aero_model: Optional[str] = None
         self.x: Optional[np.ndarray] = None
         self.conn: Optional[np.ndarray] = None
@@ -189,25 +210,15 @@ class IntrinsicFlutterSolver(BaseSolver):
         self.component_names: Optional[list[str]] = None
         self.node_names: Optional[list[str]] = None
 
-        self.ss_c_time = None
-        self.ss_A = None
-        self.ss_B0 = None
-        self.ss_B1 = None
-        self.ss_C = None
-        self.ss_D0 = None
-        self.ss_D1 = None
-        self.num_lags = None
+        self.aero_ss = None
+
+        self.num_lags: Optional[int] = None
         self.fm_jig_nodal = None
         self.fm_jig_modal = None
-        self.states_keep = None
-        self.outputs_keep = None
 
         self.gamma1: Optional[np.ndarray] = None
         self.gamma2: Optional[np.ndarray] = None
         self.phi1: Optional[np.ndarray] = None
-        self.q0_bar: Optional[np.ndarray] = None
-        self.q2_bar: Optional[np.ndarray] = None
-        self.lambda_bar: Optional[np.ndarray] = None
 
     def initialise(self, data: sharpy.presharpy.presharpy.PreSharpy, custom_settings=None, restart=False):
         # Load solver settings
@@ -252,16 +263,34 @@ class IntrinsicFlutterSolver(BaseSolver):
             self.flutter = dict()
 
     def run(self, **kwargs) -> sharpy.presharpy.presharpy.PreSharpy:
+        # velocities to use for analysis
+        self.num_u_infs = 1 if self.settings['velocity_num'] == 0 else self.settings['velocity_num']
+        if self.settings['velocity_num'] == 0:
+            self.u_infs = [self.settings['u_inf']]
+        else:
+            self.u_infs = list(np.linspace(self.settings['velocity_min'], self.settings['velocity_max'],
+                                     self.settings['velocity_num']))
+
+
         # Create all case inputs
         self.get_grid()
         self.transform_struct()
         self.evals_struct, self.evecs_struct = self.calculate_eigs()
 
+        if self.settings['remove_symmetric']:
+            self.num_nodes = (self.data.structure.num_node + 1) // 2
+            self.num_modes = int(self.num_modes / 2)
+        else:
+            self.num_nodes = self.data.structure.num_node
+
+
         # Add aero attributes from input aero model
         self.aero_model: str = self.settings['aero_approx']
 
         if self.aero_model == 'statespace':
-            self.statespace_structure()
+            self.aero_ss = []
+            for u_inf in self.u_infs:
+                self.statespace_structure(u_inf)
         else:
             raise KeyError(f"Aero model {self.aero_model} not recognised")
 
@@ -270,9 +299,7 @@ class IntrinsicFlutterSolver(BaseSolver):
         config = Config(self.input)
 
         # Run case
-        cout.cout_wrap("\nRunning Intrinsic Solver", 0)
         sol = fem4inas_main.main(input_obj=config)
-        cout.cout_wrap("Intrinsic Solution Complete", 0)
 
         intrinsic_out = self.IntrinsicObj(sol, self.m_global, self.k_global, self.settings['orientation'])
         self.data.intrinsic = intrinsic_out
@@ -282,28 +309,31 @@ class IntrinsicFlutterSolver(BaseSolver):
         self.gamma2 = np.array(self.data.intrinsic.gamma2)
         self.omega = np.array(self.data.intrinsic.omega)
 
-        # if self.settings['remove_symmetric']:
-        #     new_phi1 = np.zeros((self.num_modes // 2, *self.phi1.shape[1:]))
-        #     for i_mode in range(self.num_modes // 2):
-        #         new_phi1[i_mode, ...] = self.phi1[2 * i_mode, ...]
-        #         new_phi1[i_mode, ...] += self.phi1[2 * i_mode + 1, ...]
-        #     self.phi1 = new_phi1
-        #     self.omega = self.omega[::2]
-        #     self.gamma1 = self.gamma1[::2, ::2, ::2]
-        #     self.gamma2 = self.gamma2[::2, ::2, ::2]
-
         self.jig_loads()
 
-        self.data.intrinsic.flutter['r_bar'] = self.find_static_sol()
-        sys_mat = self.assemble_sys()
+        self.num_ae_states = 2 * self.num_modes + self.num_lags
+        self.data.intrinsic.flutter['r_bar'] = np.zeros((self.num_u_infs, 3, self.num_nodes)) if self.settings['integrate_static'] else None
+        self.data.intrinsic.flutter['q2_bar'] = np.zeros((self.num_u_infs, self.num_modes))
+        self.data.intrinsic.flutter['q0_bar'] = np.zeros((self.num_u_infs, self.num_modes))
+        self.data.intrinsic.flutter['lambda_bar'] = np.zeros((self.num_u_infs, self.num_lags))
+        self.data.intrinsic.flutter['evecs_ae'] = np.zeros((self.num_u_infs, self.num_ae_states, self.num_ae_states), dtype=complex)
+        self.data.intrinsic.flutter['evals_ae'] = np.zeros((self.num_u_infs, self.num_ae_states), dtype=complex)
 
-        self.data.intrinsic.flutter['q2_bar'] = self.q2_bar
-        self.data.intrinsic.flutter['q0_bar'] = self.q0_bar
-        self.data.intrinsic.flutter['lambda_bar'] = self.lambda_bar
-        self.data.intrinsic.flutter['sys_mat'] = sys_mat
-        self.data.intrinsic.flutter['evecs_ae'] = self.evecs_ae
-        self.data.intrinsic.flutter['evals_ae'] = self.evals_ae
-        self.data.intrinsic.flutter['evecs_struct'] = self.evecs_struct
+        self.data.intrinsic.flutter['u_infs'] = self.u_infs
+        for i_u_inf, u_inf in enumerate(self.u_infs):
+            cout.cout_wrap(f"u_inf = {u_inf:.1f}", 1)
+            q0_bar, q2_bar, lambda_bar, ra = self.find_static_sol(i_u_inf)
+            sys_mat, evals_ae, evecs_ae = self.assemble_sys(q2_bar, i_u_inf)
+
+            if self.settings['integrate_static']:
+                self.data.intrinsic.flutter['r_bar'][i_u_inf, ...] = ra
+
+            self.data.intrinsic.flutter['q2_bar'][i_u_inf] = q2_bar
+            self.data.intrinsic.flutter['q0_bar'][i_u_inf] = q0_bar
+            self.data.intrinsic.flutter['lambda_bar'][i_u_inf] = lambda_bar
+            self.data.intrinsic.flutter['evecs_ae'][i_u_inf, ...] = evecs_ae
+            self.data.intrinsic.flutter['evals_ae'][i_u_inf, ...] = evals_ae
+
 
         return self.data
 
@@ -331,8 +361,6 @@ class IntrinsicFlutterSolver(BaseSolver):
 
         self.node_names = [self.component_names[0]] + [self.component_names[i] for i in self.beam_number for _ in
                                                        (0, 1)]
-
-        pass
 
     def transform_struct(self) -> None:
         # transform mass and stiffness to global frame
@@ -405,8 +433,7 @@ class IntrinsicFlutterSolver(BaseSolver):
         inp.fem.eig_type = "inputs"
 
         if self.settings['remove_symmetric']:
-            num_nodes = (inp.fem.X.shape[0] + 1) // 2
-            keep_nodes = slice(0, num_nodes)
+            keep_nodes = slice(0, self.num_nodes)
             keep_dof = slice(0, inp.fem.Ma.shape[0] // 2)
 
             inp.fem.X = inp.fem.X[keep_nodes, :]
@@ -420,71 +447,90 @@ class IntrinsicFlutterSolver(BaseSolver):
 
             inp.fem.connectivity = {"A": None}
 
-            inp.fem.num_modes = int(inp.fem.num_modes / 2)
             inp.fem.component_vect = inp.fem.component_vect[keep_nodes]
             inp.fem.fe_order = inp.fem.fe_order[keep_nodes]
 
-            pass
-
         return inp
 
-    def statespace_structure(self) -> None:
+    def statespace_structure(self, u_inf: float) -> None:
         """
         Convert statespace system from discrete to continuous time and partition by input
         """
 
         # Remove structural states
-        self.states_keep = []
+        state_counter = 0
+        states_keep = []
+        i_new_states = dict()
+
         for i_s in range(self.data.linear.ss.state_variables.num_variables):
-            if self.data.linear.ss.state_variables.vector_variables[i_s].name not in ['q', 'q_dot']:
-                self.states_keep += list(self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc)
+            if (state := self.data.linear.ss.state_variables.vector_variables[i_s].name) not in ['q', 'q_dot']:
+                index = self.data.linear.ss.state_variables.vector_variables[i_s].cols_loc
+                states_keep.extend(list(index))
+                n_states = len(index)
+                i_new_states[state] = np.arange(state_counter, state_counter + n_states)
+                state_counter += n_states
+        self.num_lags = len(states_keep)
 
         # Remove non-forcing outputs
-        self.outputs_keep = []
+        output_counter = 0
+        outputs_keep = []
+        i_new_outputs = dict()
+
         for i_s in range(self.data.linear.ss.output_variables.num_variables):
-            if self.data.linear.ss.output_variables.vector_variables[i_s].name == 'Q':
-                self.outputs_keep += list(self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc)
+            if (output := self.data.linear.ss.output_variables.vector_variables[i_s].name) == 'Q':
+                index = self.data.linear.ss.output_variables.vector_variables[i_s].rows_loc
+                outputs_keep.extend(list(index))
+                n_outputs = len(index)
+                i_new_outputs[output] = np.arange(output_counter, output_counter + n_outputs)
+                output_counter += n_outputs
+
+        # scale model
+        force_scaling = u_inf ** 2 / (self.settings['u_inf'] ** 2)
+        time_scaling = self.settings['u_inf'] / u_inf
+        circulation_scaling = u_inf / self.settings['u_inf']
 
         # Truncate states and outputs
-        ss_d_trunc = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(self.states_keep, self.states_keep)], \
-                                            self.data.linear.ss.B[self.states_keep, :], \
-                                            self.data.linear.ss.C[np.ix_(self.outputs_keep, self.states_keep)], \
-                                            self.data.linear.ss.D[self.outputs_keep, :], \
-                                            self.data.linear.ss.dt)
+        if 'krylov' in i_new_states.keys():
+            ss_d = pyyeti.ssmodel.SSModel(self.data.linear.ss.A[np.ix_(states_keep, states_keep)],
+                                          self.data.linear.ss.B[states_keep, :],
+                                          self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)] * force_scaling,
+                                          self.data.linear.ss.D[outputs_keep, :] * force_scaling,
+                                          self.data.linear.ss.dt * time_scaling)
+        else:
+            a = self.data.linear.ss.A[np.ix_(states_keep, states_keep)]
+            b = self.data.linear.ss.B[states_keep, :]
+            c = self.data.linear.ss.C[np.ix_(outputs_keep, states_keep)] * force_scaling
+            d = self.data.linear.ss.D[outputs_keep, :] * force_scaling
+            dt = self.data.linear.ss.dt * time_scaling
+
+            circ_dt_states = i_new_states['dtgamma_dot']
+            circ_states = np.concatenate((i_new_states['gamma'], i_new_states['gamma_w'], i_new_states['gamma_m1']))
+
+            b *= circulation_scaling
+            c /= circulation_scaling
+            b[circ_dt_states, :] *= time_scaling
+            c[:, circ_dt_states] /= time_scaling
+
+            ss_d = pyyeti.ssmodel.SSModel(a, b, c, d, dt)
 
         # Convert to continuous time state space model
-        self.ss_c_time = ss_d_trunc.d2c(self.settings['d2c_method'])
+        ss_c = ss_d.d2c(self.settings['d2c_method'])
 
         # Split into three state space systems for each input
-        # The A and C matrices are constant between the three
-
-        self.ss_A = self.ss_c_time.A
-        self.ss_C = self.ss_c_time.C
-        self.ss_B0 = None
-        self.ss_B1 = None
-        self.ss_D0 = None
-        self.ss_D1 = None
-
-        self.num_lags = self.ss_A.shape[0]
+        self.aero_ss.append(dict())
+        self.aero_ss[-1]['A'] = ss_c.A
+        self.aero_ss[-1]['C'] = ss_c.C
 
         for i_s in range(self.data.linear.ss.input_variables.num_variables):
             var_name = self.data.linear.ss.input_variables.vector_variables[i_s].name
             param_index = self.data.linear.ss.input_variables.vector_variables[i_s].cols_loc
             match var_name:
                 case 'q':
-                    self.ss_B0 = self.ss_c_time.B[:, param_index]
-                    self.ss_D0 = self.ss_c_time.D[:, param_index]
+                    self.aero_ss[-1]['B0'] = ss_c.B[:, param_index]
+                    self.aero_ss[-1]['D0'] = ss_c.D[:, param_index]
                 case 'q_dot':
-                    self.ss_B1 = self.ss_c_time.B[:, param_index]
-                    self.ss_D1 = self.ss_c_time.D[:, param_index]
-                case 'u_gust':
-                    pass
-
-        assert not (self.ss_B0 is None
-                    or self.ss_B1 is None
-                    or self.ss_D0 is None
-                    or self.ss_D1 is None), \
-            "Missing partition of state space inputs"
+                    self.aero_ss[-1]['B1'] = ss_c.B[:, param_index]
+                    self.aero_ss[-1]['D1'] = ss_c.D[:, param_index]
 
     def jig_loads(self) -> None:
         """
@@ -594,16 +640,21 @@ class IntrinsicFlutterSolver(BaseSolver):
         evecs_scaled = evecs_global @ np.diag(overall_scaling)
         return evals_global, evecs_scaled
 
-    def find_static_sol(self) -> np.array:
+    def find_static_sol(self, i_u_inf: int) -> tuple[np.array, np.array, np.array, Optional[np.array]]:
         """
-        Find the static solution to the system
+        Find the static solution to the system. Input parameter with index of aerodynamic model to use
+
+        Returns q0_bar, q2_bar, lambda_bar, ra
         """
 
         gamma2 = jnp.array(self.gamma2)
-        eta_jig = jnp.array(self.fm_jig_modal)
+        eta_jig = jnp.array(self.fm_jig_modal) * (self.u_infs[i_u_inf] / self.settings['u_inf']) ** 2
 
         e_mat = jnp.real(
-            jnp.array(np.diag(self.omega) + (self.ss_C @ np.linalg.inv(self.ss_A) @ self.ss_B0 - self.ss_D0)
+            jnp.array(np.diag(self.omega) + (self.aero_ss[i_u_inf]['C']
+                                             @ np.linalg.inv(self.aero_ss[i_u_inf]['A'])
+                                             @ self.aero_ss[i_u_inf]['B0']
+                                             - self.aero_ss[i_u_inf]['D0'])
                       @ np.diag(1.0 / self.omega)))
 
         def f(q2: jnp.ndarray):
@@ -612,64 +663,65 @@ class IntrinsicFlutterSolver(BaseSolver):
         def f_prime_inv(q2: jnp.ndarray):
             return jnp.linalg.inv(jax.jacfwd(f, argnums=0)(q2))
 
-        q2 = -jnp.ones_like(self.fm_jig_modal)
+        q2_bar = -jnp.ones_like(self.fm_jig_modal)
 
         # iterate
         for i_iter in range(self.settings['max_iter']):
-            f_val = f(q2)
+            f_val = f(q2_bar)
             res = np.linalg.norm(f_val)
             if res < 1e-9:
                 break
             elif i_iter == self.settings['max_iter'] - 1:
                 raise RuntimeError(f"Static solution not converged, Residual: {res:.2f}")
-            f_prime_inv_val = f_prime_inv(q2)
-            q2 = q2 - f_prime_inv_val @ f_val
+            f_prime_inv_val = f_prime_inv(q2_bar)
+            q2_bar = q2_bar - f_prime_inv_val @ f_val
 
-        self.q2_bar = np.array(q2)
-        self.q0_bar = -np.diag(1.0 / self.omega) @ self.q2_bar
-        self.lambda_bar = -np.linalg.inv(self.ss_A) @ self.ss_B0 @ np.diag(1.0 / self.omega) @ self.q2_bar
+        q2_bar = np.array(q2_bar)
+        q0_bar = -np.diag(1.0 / self.omega) @ q2_bar
+        lambda_bar = (-np.linalg.inv(self.aero_ss[i_u_inf]['A']) @ self.aero_ss[i_u_inf]['B0']
+                      @ np.diag(1.0 / self.omega) @ q2_bar)
 
-        # self.input.systems.sett.s1.init_states = dict(q2=["prescribed", jnp.array(self.q2_bar)])
-        if self.settings['remove_symmetric']:
-            self.input.systems.sett.s1.q0_input = np.concatenate((np.zeros(self.num_modes // 2), self.q2_bar))
+        if self.settings["integrate_static"]:
+            self.input.systems.sett.s1.q0_input = np.concatenate((np.zeros(self.num_modes), q2_bar))
+            self.input.systems.sett.s1.t1 = 1e-8
+
+            config = Config(self.input)
+            sol = fem4inas_main.main(input_obj=config)
+            ra = np.array(sol.dynamicsystem_s1.ra[0, ...])
         else:
-            self.input.systems.sett.s1.q0_input = np.concatenate((np.zeros(self.num_modes), self.q2_bar))
-        self.input.systems.sett.s1.t1 = 1e-8
+            ra = None
 
-        config = Config(self.input)
-        sol = fem4inas_main.main(input_obj=config)
+        return q0_bar, q2_bar, lambda_bar, ra
 
-        return np.array(sol.dynamicsystem_s1.ra[0, ...])
+    def assemble_sys(self, q2_bar: np.array, i_u_inf: int) -> tuple[np.array, np.array, np.array]:
+        """
+        Returns system matrix, eigenvalues and eigenvectors
+        """
+        omega_inv = np.diag(1.0 / self.omega)
+        elem12 = ((np.diag(self.omega) - np.einsum('jik,k->ji', self.gamma2, q2_bar)
+                   - np.einsum('jik,i->jk', self.gamma2, q2_bar))
+                  - self.aero_ss[i_u_inf]['D0'] @ omega_inv)
 
-    def assemble_sys(self) -> None:
+        elem21 = -np.diag(self.omega) + np.einsum('ijk,k->ji', self.gamma2, q2_bar)
+        elem32 = -self.aero_ss[i_u_inf]['B0'] @ omega_inv
 
-        elem12 = ((np.diag(self.omega) - np.einsum('jik,k->ji', self.gamma2, self.q2_bar)
-                   - np.einsum('jik,i->jk', self.gamma2, self.q2_bar))
-                  - self.ss_D0 @ np.diag(1.0 / self.omega))
+        sys_mat = np.block([[self.aero_ss[i_u_inf]['D1'], elem12, self.aero_ss[i_u_inf]['C']],
+                            [elem21, np.zeros((self.num_modes, self.num_modes + self.num_lags))],
+                            [self.aero_ss[i_u_inf]['B1'], elem32, self.aero_ss[i_u_inf]['A']]])
 
-        elem21 = -np.diag(self.omega) + np.einsum('ijk,k->ji', self.gamma2, self.q2_bar)
-        elem32 = -self.ss_B0 @ np.diag(1.0 / self.omega)
-
-        if self.settings['remove_symmetric']:
-            self.sys_mat = np.block([[self.ss_D1, elem12, self.ss_C],
-                                     [elem21, np.zeros((self.num_modes // 2, self.num_modes // 2 + self.num_lags))],
-                                     [self.ss_B1, elem32, self.ss_A]])
-        else:
-            self.sys_mat = np.block([[self.ss_D1, elem12, self.ss_C],
-                                 [elem21, np.zeros((self.num_modes, self.num_modes + self.num_lags))],
-                                 [self.ss_B1, elem32, self.ss_A]])
-
-        self.evals_ae, self.evecs_ae = np.linalg.eig(self.sys_mat)
+        evals_ae, evecs_ae = np.linalg.eig(sys_mat)
 
         cout.cout_wrap("Validating system stability", 0)
 
-        is_stable = self.evals_ae.real < 0.0
+        is_stable = evals_ae.real < 0.0
         cout.cout_wrap(f"Stable: {np.all(is_stable)}", 1)
         if not np.all(is_stable):
             cout.cout_wrap(f"Unstable Eigenvalues:", 1)
-            unstable_evals = self.evals_ae[~is_stable]
+            unstable_evals = evals_ae[~is_stable]
             for eval in unstable_evals:
                 cout.cout_wrap(str(eval), 2)
             cout.cout_wrap(f"Unstable Frequencies:", 1)
             for eval in unstable_evals:
                 cout.cout_wrap(str(np.abs(eval) / (2.0 * np.pi)) + ' Hz', 2)
+
+        return sys_mat, evals_ae, evecs_ae

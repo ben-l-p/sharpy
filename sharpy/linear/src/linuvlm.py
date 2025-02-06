@@ -375,8 +375,6 @@ class Static():
                 # section indices
                 iivec = [II_start + np.ravel_multi_index((cc, nn),
                                                          (3, N + 1)) for cc in range(3)]
-                # iivec = [II_start + cc+6*nn for cc in range(6)]
-                # iivec = [II_start + cc*(N+1) + nn for cc in range(6)]
 
                 for mm in range(M + 1):
                     # vertex indices
@@ -1823,10 +1821,6 @@ class DynamicBlock(Dynamic):
                    self.ScalingFacts['speed'] / self.ScalingFacts['force'],
                    self.ScalingFacts['speed'] / self.ScalingFacts['force']]
 
-        D_facts = [self.ScalingFacts['length'] / self.ScalingFacts['force'],
-                   self.ScalingFacts['speed'] / self.ScalingFacts['force'],
-                   self.ScalingFacts['speed'] / self.ScalingFacts['force']]
-
         C_facts = self.nblock_x * \
                   [self.ScalingFacts['circulation'] / self.ScalingFacts['force']]
 
@@ -1899,17 +1893,9 @@ class DynamicBlock(Dynamic):
         t0 = time.time()
         MS = self.MS
         K, K_star = self.K, self.K_star
-        Kzeta = self.Kzeta
 
         # ------------------------------------------------------ determine size
 
-        Nx = self.Nx
-        Nu = self.Nu
-        Ny = self.Ny
-
-        nblock_x = self.nblock_x
-        nblock_u = self.nblock_u
-        nblock_y = self.nblock_y
 
         if self.integr_order == 2:
             # Second order differencing scheme coefficients
@@ -1925,10 +1911,9 @@ class DynamicBlock(Dynamic):
                                              target='collocation', Project=True)
         A0 = np.block(List_AICs)
         A0W = np.block(List_AICs_star)
-        List_AICs, List_AICs_star = None, None
+
         LU, P = scalg.lu_factor(A0)
         AinvAW = scalg.lu_solve((LU, P), A0W)
-        A0, A0W = None, None
 
         ### propagation of circ
         # fast and memory efficient with both dense and sparse matrices
@@ -1941,7 +1926,6 @@ class DynamicBlock(Dynamic):
         else:
             Cgamma = scalg.block_diag(*List_C)
             CgammaW = scalg.block_diag(*List_Cstar)
-        List_C, List_Cstar = None, None
 
         # recurrent dense terms stored as numpy.ndarrays
         AinvAWCgamma = -libsp.dot(AinvAW, Cgamma)
@@ -1957,9 +1941,6 @@ class DynamicBlock(Dynamic):
         Ass.append([Cgamma, CgammaW, None, ])
         if self.integr_order == 2: Ass[1].append(None)
 
-        Cgamma = None
-        CgammaW = None
-
         # delta eq.
         if self.use_sparse:
             ones = libsp.csc_matrix(
@@ -1974,8 +1955,6 @@ class DynamicBlock(Dynamic):
             Ass.append([bp1 * AinvAWCgamma + b0 * ones, bp1 * AinvAWCgammaW, None, bm1 * ones])
             # identity eq.
             Ass.append([ones, None, None, None])
-        AinvAWCgamma = None
-        AinvAWCgammaW = None
 
         # zeta derivs
         List_nc_dqcdzeta = ass.nc_dqcdzeta(MS.Surfs, MS.Surfs_star, Merge=True)
@@ -1985,9 +1964,6 @@ class DynamicBlock(Dynamic):
             List_nc_dqcdzeta[ss][ss] += \
                 (List_uc_dncdzeta[ss] + List_nc_domegazetadzeta_vert[ss])
         Ducdzeta = np.block(List_nc_dqcdzeta)  # dense matrix
-        List_nc_dqcdzeta = None
-        List_uc_dncdzeta = None
-        List_nc_domegazetadzeta_vert = None
 
         # ext velocity derivs (Wnv0)
         List_Wnv = []
@@ -1996,14 +1972,12 @@ class DynamicBlock(Dynamic):
                 interp.get_Wnv_vector(MS.Surfs[ss],
                                       MS.Surfs[ss].aM, MS.Surfs[ss].aN))
         AinvWnv0 = scalg.lu_solve((LU, P), scalg.block_diag(*List_Wnv))
-        List_Wnv = None
 
         ### B matrix assembly
         Bss = []
 
         # non-penetration condition
         Bss.append([-scalg.lu_solve((LU, P), Ducdzeta), AinvWnv0, -AinvWnv0])
-        AinvWnv0 = None
 
         # circulation eq.
         Bss.append([None, None, None])
@@ -2017,8 +1991,6 @@ class DynamicBlock(Dynamic):
         # indentity eq
         if self.integr_order == 2:
             Bss.append([None, None, None])
-
-        LU, P = None, None
 
         # ---------------------------------------------------------- output eq.
 
@@ -2036,8 +2008,6 @@ class DynamicBlock(Dynamic):
             List_dfqsdvind_gamma_star[ss][ss] += List_dfqsdgamma_star_vrel0[ss]
         Dfqsdgamma = np.block(List_dfqsdvind_gamma)
         Dfqsdgamma_star = np.block(List_dfqsdvind_gamma_star)
-        List_dfqsdvind_gamma, List_dfqsdvind_gamma_star = None, None
-        List_dfqsdgamma_vrel0, List_dfqsdgamma_star_vrel0 = None, None
 
         # gamma_dot
         Dfunstdgamma_dot = scalg.block_diag(*ass.dfunstdgamma_dot(MS.Surfs))
@@ -2094,9 +2064,7 @@ class DynamicBlock(Dynamic):
         steady_solve.
         """
 
-        MS = self.MS
         K = self.K
-        K_star = self.K_star
 
         Eye = np.eye(K)
         Bup = np.hstack(self.SS.B[0])
